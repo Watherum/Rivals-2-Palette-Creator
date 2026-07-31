@@ -1,0 +1,36 @@
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# --- virtualenvs (project runs on a global interpreter, but just in case) ---
+.venv/
+venv/
+env/
+
+# --- test / tooling caches -------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+Zone.Identifier
+
+# --- app output (user-generated, not source) -------------------------------
+Resources/Character_Renders_Custom/
+Resources/Presets/
+
+# --- downloaded wiki assets ------------------------------------------------
+# Character_Renders_Source is deliberately tracked (~365 MB) so a fresh clone
+# works without running Python_Scripts/download_rivals_renders.py first.
+# Uncomment to stop shipping them:
+# Resources/Character_Renders_Source/

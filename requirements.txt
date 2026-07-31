@@ -1,0 +1,21 @@
+# Runtime dependencies for the Rivals 2 Palette Creator.
+# Install with install_requirements.bat (Windows) or:
+#   python -m pip install --only-binary=:all: -r requirements.txt
+
+customtkinter>=5.2.2      # GUI toolkit
+numpy>=2.0                # all pixel math
+pillow>=11.0              # PNG I/O and Tk image bridge
+requests>=2.32            # dragdown.wiki MediaWiki API
+scipy>=1.14               # kmeans2 (k-means++) and ndimage filters
+scikit-image>=0.24        # sRGB <-> CIELAB conversion
+
+# Deliberately NOT required:
+#   scikit-learn   - scipy.cluster.vq.kmeans2(minit="++") is k-means++ and runs
+#                    the k=12 clustering in ~50 ms. Avoiding it also removes the
+#                    dependency most likely to lack a wheel on a new Python ABI.
+#   opencv-python  - ~90 MB for nothing. This app converts color on masked flat
+#                    (N, 3) arrays, where skimage measured faster than cv2's
+#                    full-frame path.
+
+# Test-only (not needed to run the app):
+#   pytest
