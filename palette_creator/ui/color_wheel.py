@@ -163,6 +163,9 @@ class ColorEditor(ctk.CTkFrame):
         self._on_change = on_change
         self._updating = False
         self._rgb = (255, 255, 255)
+        self._last_typed = "hex"
+        """Which text field the user touched most recently, so Apply knows
+        whether the hex box or the R/G/B boxes hold the intended value."""
 
         self.grid_columnconfigure(0, weight=1)
 
@@ -193,6 +196,7 @@ class ColorEditor(ctk.CTkFrame):
         self._hex.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self._hex.bind("<Return>", self._on_hex)
         self._hex.bind("<FocusOut>", self._on_hex)
+        self._hex.bind("<Key>", lambda _e: setattr(self, "_last_typed", "hex"), add="+")
 
         rgb_row = ctk.CTkFrame(self, fg_color="transparent")
         rgb_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(6, 0))
@@ -206,6 +210,7 @@ class ColorEditor(ctk.CTkFrame):
             entry.grid(row=0, column=i * 2 + 1, sticky="ew")
             entry.bind("<Return>", self._on_rgb_entry)
             entry.bind("<FocusOut>", self._on_rgb_entry)
+            entry.bind("<Key>", lambda _e: setattr(self, "_last_typed", "rgb"), add="+")
             self._rgb_entries.append(entry)
 
         ctk.CTkButton(
@@ -213,9 +218,39 @@ class ColorEditor(ctk.CTkFrame):
             text="System picker...",
             height=28,
             command=self._open_system_picker,
-        ).grid(row=4, column=0, sticky="ew", padx=8, pady=(8, 8))
+        ).grid(row=4, column=0, sticky="ew", padx=8, pady=(8, 4))
+
+        self._apply_btn = ctk.CTkButton(
+            self,
+            text="Apply color",
+            height=32,
+            fg_color="#2e5f2e",
+            hover_color="#3a763a",
+            command=self.apply,
+        )
+        self._apply_btn.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 8))
 
         self.set_color((255, 255, 255), "init")
+
+    # -- explicit commit ----------------------------------------------------
+
+    def apply(self) -> None:
+        """Commit whatever is typed in the text fields, without needing Enter.
+
+        The wheel already commits live on drag; this exists for the hex and
+        R/G/B boxes, where a typed value otherwise sits there doing nothing
+        until the field happens to lose focus.
+        """
+        if self._last_typed == "rgb":
+            self._on_rgb_entry()
+        else:
+            self._on_hex()
+
+        # Both handlers no-op when the text already equals the current color,
+        # so fire the callback unconditionally -- pressing Apply should always
+        # push the shown color onto the rule.
+        if self._on_change is not None:
+            self._on_change(self._rgb)
 
     # -- the single funnel --------------------------------------------------
 

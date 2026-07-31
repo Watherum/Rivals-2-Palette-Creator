@@ -39,10 +39,12 @@ class ImageCanvas(tk.Frame):
         master,
         *,
         on_pick: Callable[[int, int, str], None] | None = None,
+        on_region: Callable[[str, list], None] | None = None,
         **kw,
     ):
         super().__init__(master, bd=0, highlightthickness=0, **kw)
         self.on_pick = on_pick
+        self.on_region = on_region
 
         self.canvas = tk.Canvas(
             self, highlightthickness=0, bd=0, bg="#1b1b1b", cursor="arrow"
@@ -58,8 +60,14 @@ class ImageCanvas(tk.Frame):
         self._eyedropper = False
         self._pan_anchor: tuple[float, float] | None = None
 
+        self._draw_mode: str | None = None  # None | "rect" | "lasso"
+        self._drawing: list[tuple[float, float]] | None = None  # image coords
+        self._region: tuple[str, list] | None = None  # committed, normalized
+
         self.canvas.bind("<Configure>", self._on_resize)
-        self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<Button-1>", self._on_button1)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Control-Button-1>", lambda e: self._on_click(e, "target"))
         self.canvas.bind("<Shift-Button-1>", lambda e: self._on_click(e, "exact"))
         self.canvas.bind("<Button-3>", self._start_pan)
@@ -95,7 +103,77 @@ class ImageCanvas(tk.Frame):
 
     def set_eyedropper(self, active: bool) -> None:
         self._eyedropper = active
-        self.canvas.configure(cursor="tcross" if active else "arrow")
+        self._apply_cursor()
+
+    # -- region drawing -----------------------------------------------------
+
+    def set_draw_mode(self, mode: str | None) -> None:
+        """``None``, ``"rect"`` or ``"lasso"``. Drawing preempts the eyedropper."""
+        self._draw_mode = mode
+        self._drawing = None
+        self._apply_cursor()
+        self._draw_overlay()
+
+    @property
+    def draw_mode(self) -> str | None:
+        return self._draw_mode
+
+    def set_region(self, region) -> None:
+        """Show ``region`` (a recolor.Region) as the committed outline."""
+        if region is None or not region.is_valid():
+            self._region = None
+        else:
+            self._region = (region.kind, list(region.points))
+        self._draw_overlay()
+
+    def _apply_cursor(self) -> None:
+        if self._draw_mode is not None:
+            cursor = "crosshair"
+        elif self._eyedropper:
+            cursor = "tcross"
+        else:
+            cursor = "arrow"
+        self.canvas.configure(cursor=cursor)
+
+    def _image_to_canvas(self, x: float, y: float) -> tuple[float, float]:
+        return (self._offset[0] + x * self._zoom, self._offset[1] + y * self._zoom)
+
+    def _draw_overlay(self) -> None:
+        """Redraw the region outline as canvas items.
+
+        Kept as canvas items rather than painted into the numpy frame so that
+        dragging an outline never triggers a re-render of the image itself.
+        """
+        self.canvas.delete("region")
+        if self._frame is None:
+            return
+        ih, iw = self._frame.shape[:2]
+
+        if self._drawing:
+            kind, pts = self._draw_mode, self._drawing
+        elif self._region:
+            kind, norm = self._region
+            pts = [(u * (iw - 1), v * (ih - 1)) for u, v in norm]
+        else:
+            return
+
+        canvas_pts = [self._image_to_canvas(x, y) for x, y in pts]
+        if kind == "rect" and len(canvas_pts) == 2:
+            (x0, y0), (x1, y1) = canvas_pts
+            shape = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        elif kind == "lasso" and len(canvas_pts) >= 2:
+            shape = canvas_pts
+        else:
+            return
+
+        flat = [c for point in shape for c in point]
+        # Black under white so the outline reads against any color beneath it.
+        self.canvas.create_polygon(
+            flat, outline="#000000", fill="", width=3, tags="region"
+        )
+        self.canvas.create_polygon(
+            flat, outline="#ffffff", fill="", width=1, dash=(5, 4), tags="region"
+        )
 
     @property
     def zoom(self) -> float:
@@ -152,6 +230,7 @@ class ImageCanvas(tk.Frame):
         self.canvas.create_image(
             self._offset[0], self._offset[1], anchor="nw", image=self._photo
         )
+        self._draw_overlay()
 
     # -- coordinate mapping -------------------------------------------------
 
@@ -165,12 +244,78 @@ class ImageCanvas(tk.Frame):
             return None
         return int(x), int(y)
 
+    def _canvas_to_image_clamped(self, cx: float, cy: float) -> tuple[float, float] | None:
+        """Like :meth:`canvas_to_image` but clamps instead of rejecting.
+
+        Dragging a selection past the edge of the sprite should pin to the
+        border, not abort the gesture.
+        """
+        if self._frame is None or self._zoom <= 0:
+            return None
+        ih, iw = self._frame.shape[:2]
+        x = (cx - self._offset[0]) / self._zoom
+        y = (cy - self._offset[1]) / self._zoom
+        return (float(np.clip(x, 0, iw - 1)), float(np.clip(y, 0, ih - 1)))
+
     # -- events -------------------------------------------------------------
 
     def _on_resize(self, _event) -> None:
         if self._frame is not None:
             self._fit_pending = True
             self._render()
+
+    def _on_button1(self, event) -> None:
+        if self._draw_mode is not None:
+            point = self._canvas_to_image_clamped(event.x, event.y)
+            if point is None:
+                return
+            self._drawing = [point, point] if self._draw_mode == "rect" else [point]
+            self._draw_overlay()
+            return
+        self._on_click(event)
+
+    def _on_drag(self, event) -> None:
+        if self._draw_mode is None or self._drawing is None:
+            return
+        point = self._canvas_to_image_clamped(event.x, event.y)
+        if point is None:
+            return
+        if self._draw_mode == "rect":
+            self._drawing[1] = point
+        else:
+            # Thin the trail: raw motion events give sub-pixel steps that bloat
+            # the polygon without changing its shape.
+            last = self._drawing[-1]
+            if abs(point[0] - last[0]) + abs(point[1] - last[1]) >= 1.5:
+                self._drawing.append(point)
+        self._draw_overlay()
+
+    def _on_release(self, _event) -> None:
+        if self._draw_mode is None or self._drawing is None:
+            return
+        pts, kind = self._drawing, self._draw_mode
+        self._drawing = None
+
+        if self._frame is None:
+            return
+        ih, iw = self._frame.shape[:2]
+
+        too_small = (
+            kind == "rect"
+            and (
+                abs(pts[1][0] - pts[0][0]) < 2 or abs(pts[1][1] - pts[0][1]) < 2
+            )
+        ) or (kind == "lasso" and len(pts) < 3)
+        if too_small:
+            # A stray click rather than a drag; leave any existing region alone.
+            self._draw_overlay()
+            return
+
+        norm = [(x / max(iw - 1, 1), y / max(ih - 1, 1)) for x, y in pts]
+        self._region = (kind, norm)
+        self._draw_overlay()
+        if self.on_region is not None:
+            self.on_region(kind, norm)
 
     def _on_click(self, event, kind: str = "source") -> None:
         if not self._eyedropper or self.on_pick is None:

@@ -22,11 +22,79 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
+from PIL import Image, ImageDraw
 from scipy import ndimage
 
 from .colorspace import gamut_compress, lab_to_rgb
 from .config import CHROMA_EPS, CHROMA_MAX
 from .imagectx import ImageContext, PixelSet
+
+
+CHROMA_GAIN_MAX = 2.0
+"""Ceiling on how much the chroma remap may multiply a pixel's distance from the
+neutral axis. Chosen to sit above the ratio a genuinely colored material needs
+(a chroma-40 source retargeted to chroma-72 wants 1.8x) while cutting off the
+runaway gains that near-gray sources produce."""
+
+WRITE_EPS = 1.0 / 512.0
+"""Below this a rule's contribution cannot move an 8-bit channel, so it does not
+count as writing to the pixel and does not take ownership of it."""
+
+
+@dataclass
+class Region:
+    """A user-drawn area that confines a rule, in normalized 0..1 coords.
+
+    Normalized rather than pixel coords for the same reason as ``seed_uv``: one
+    region has to rasterize correctly against both the proxy and the full-res
+    frame. ``kind`` is ``"rect"`` (two opposite corners) or ``"lasso"`` (polygon
+    vertices, implicitly closed).
+    """
+
+    kind: str
+    points: list[tuple[float, float]]
+    _mask_cache: dict = field(default_factory=dict, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self.points = [(float(u), float(v)) for u, v in self.points]
+
+    def is_valid(self) -> bool:
+        return self.kind == "rect" and len(self.points) == 2 or (
+            self.kind == "lasso" and len(self.points) >= 3
+        )
+
+    def key(self) -> tuple:
+        return (self.kind, tuple((round(u, 6), round(v, 6)) for u, v in self.points))
+
+    def mask(self, shape: tuple[int, int]) -> np.ndarray:
+        """Rasterize to a ``(H, W)`` bool mask, cached per shape.
+
+        Drawn with PIL rather than a numpy point-in-polygon test: it handles
+        both shapes in one call and is fast enough (~1 ms at 1024px) to stay in
+        the interactive render path.
+        """
+        cached = self._mask_cache.get(shape)
+        if cached is not None:
+            return cached
+
+        h, w = shape
+        img = Image.new("L", (w, h), 0)
+        if self.is_valid():
+            pts = [
+                (u * (w - 1), v * (h - 1)) for u, v in self.points
+            ]
+            draw = ImageDraw.Draw(img)
+            if self.kind == "rect":
+                (x0, y0), (x1, y1) = pts
+                draw.rectangle(
+                    [min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)], fill=255
+                )
+            else:
+                draw.polygon(pts, fill=255)
+
+        out = np.asarray(img, dtype=np.uint8) > 0
+        self._mask_cache[shape] = out
+        return out
 
 
 class MatchMode(str, Enum):
@@ -89,6 +157,12 @@ class RecolorRule:
     seed_uv: tuple[float, float] | None = None
     """Where the user clicked, in normalized 0..1 coords so the same rule works
     at proxy and full resolution."""
+    region: Region | None = None
+    """A drawn area confining this rule. Unlike ``contiguous`` this needs no
+    connectivity, so it can split two parts the shading bridges together."""
+    match_all: bool = False
+    """Ignore ``region`` and match everywhere. A temporary override, so a region
+    can be kept while checking what the rule would do unconfined."""
     enabled: bool = True
     cluster_id: int | None = None
     lock_to_cluster: bool = False
@@ -121,16 +195,25 @@ class RecolorRule:
             round(float(self.feather), 4),
             round(self.effective_l_weight, 4),
             round(self.effective_c_weight, 4),
-            round(float(self.opacity), 4),
             bool(self.smooth_edges),
             bool(self.contiguous),
             None if self.seed_uv is None else tuple(round(v, 6) for v in self.seed_uv),
             bool(self.lock_to_cluster),
             self.cluster_id,
+            None if self.region is None else self.region.key(),
+            bool(self.match_all),
         )
 
     def is_identity(self) -> bool:
         return bool(np.allclose(self.source_lab, self.target_lab, atol=1e-6))
+
+    @property
+    def region_active(self) -> bool:
+        return (
+            self.region is not None
+            and self.region.is_valid()
+            and not self.match_all
+        )
 
 
 # -- selection --------------------------------------------------------------
@@ -183,12 +266,18 @@ def rule_weight(
     shape: tuple[int, int] | None = None,
     labels: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Per-pixel blend weight in 0..1 for this rule.
+    """How strongly this rule *selects* each pixel, in 0..1.
 
     The ramp is a smoothstep in *color* space, never a hard threshold. An
     antialiased pixel blending two materials lands partway along the ramp and is
     partially recolored, which is the correct answer for a pixel that is itself
     a blend.
+
+    Deliberately excludes ``opacity``: this is a claim on the pixel, not an
+    amount of paint. Folding Strength in here would make a half-strength rule
+    surrender half of every pixel it owns to whatever rule sits below it, when
+    what should show through is the *original* color. :func:`apply_rules`
+    applies Strength after ownership is settled.
     """
     d = rule_distance(ps, rule)
     d_in = rule.tolerance * (1.0 - rule.feather)
@@ -196,12 +285,13 @@ def rule_weight(
     span = max(d_out - d_in, 1e-6)
 
     t = np.clip((d_out - d) / span, 0.0, 1.0)
-    w = (t * t * (3.0 - 2.0 * t) * float(rule.opacity)).astype(np.float32)
+    w = (t * t * (3.0 - 2.0 * t)).astype(np.float32)
 
     if rule.lock_to_cluster and labels is not None and rule.cluster_id is not None:
         w = np.where(labels == rule.cluster_id, w, 0.0).astype(np.float32)
 
-    if (rule.smooth_edges or rule.contiguous) and shape is not None:
+    needs_spatial = rule.smooth_edges or rule.contiguous or rule.region_active
+    if needs_spatial and shape is not None:
         w = _spatial_postprocess(w, ps, rule, shape)
 
     return w
@@ -219,41 +309,87 @@ def _spatial_postprocess(
     if rule.smooth_edges:
         plane = ndimage.gaussian_filter(plane, sigma=0.8, mode="constant")
 
-    if rule.contiguous and rule.seed_uv is not None:
-        labeled, count = ndimage.label(plane > 0.35)
-        if count:
-            u, v = rule.seed_uv
-            sx = int(np.clip(round(u * (width - 1)), 0, width - 1))
-            sy = int(np.clip(round(v * (h - 1)), 0, h - 1))
-            target = labeled[sy, sx]
-            if target == 0:
-                # The click landed just off the region; take the nearest label.
-                ys, xs = np.nonzero(labeled)
-                if ys.size:
-                    nearest = np.argmin((ys - sy) ** 2 + (xs - sx) ** 2)
-                    target = labeled[ys[nearest], xs[nearest]]
-            if target != 0:
-                plane = np.where(labeled == target, plane, 0.0)
+    # Before the flood fill, so "this region only" traces connectivity *within*
+    # the drawn area -- otherwise a blob that leaks outside would drag the
+    # outside part back in.
+    if rule.region_active:
+        plane = np.where(rule.region.mask(shape), plane, 0.0)
+
+    if rule.contiguous:
+        plane = _keep_connected_blob(plane, rule, shape)
 
     return plane.reshape(-1)[ps.idx].astype(np.float32)
+
+
+def _keep_connected_blob(
+    plane: np.ndarray, rule: RecolorRule, shape: tuple[int, int]
+) -> np.ndarray:
+    """Keep only the connected component containing the rule's seed point.
+
+    Falls back to the largest component when the rule has no seed -- rules built
+    from a palette swatch click used to have ``seed_uv=None``, which silently
+    turned this whole flag into a no-op.
+    """
+    h, width = shape
+    labeled, count = ndimage.label(plane > 0.35)
+    if not count:
+        return plane
+
+    target = 0
+    if rule.seed_uv is not None:
+        u, v = rule.seed_uv
+        sx = int(np.clip(round(u * (width - 1)), 0, width - 1))
+        sy = int(np.clip(round(v * (h - 1)), 0, h - 1))
+        target = int(labeled[sy, sx])
+        if target == 0:
+            # The click landed just off the region; take the nearest label.
+            ys, xs = np.nonzero(labeled)
+            if ys.size:
+                nearest = np.argmin((ys - sy) ** 2 + (xs - sx) ** 2)
+                target = int(labeled[ys[nearest], xs[nearest]])
+
+    if target == 0:
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0
+        target = int(np.argmax(sizes))
+
+    return np.where(labeled == target, plane, 0.0)
 
 
 # -- transform --------------------------------------------------------------
 
 
-def _anchored(x: np.ndarray, x0: float, y0: float, hi: float) -> np.ndarray:
+def _anchored(
+    x: np.ndarray, x0: float, y0: float, hi: float, *, max_gain: float | None = None
+) -> np.ndarray:
     """Monotone piecewise-linear remap sending 0->0, x0->y0, hi->hi.
 
     This is a levels curve. It moves the material's anchor tone to the target
     while keeping every other tone in order and inside the range, so shading
     survives and nothing needs clamping. A plain additive shift would instead
     translate the whole ramp and flatten highlights against the ceiling.
+
+    ``max_gain`` caps the slope of the segment *below* the anchor. That segment
+    rises at ``y0 / x0``, which explodes when the source sits near zero -- a
+    material at chroma 2.9 retargeted to chroma 72 amplifies by 25x, and the
+    +/-1 of 8-bit quantization noise in a flat gray comes back as visible
+    speckle. Capping it keeps the anchor exactly on ``y0`` and lets the bottom
+    of the ramp land above zero instead, which is the honest answer: a pixel
+    with no chroma to scale should adopt the target's, not be scaled up from
+    nothing. The cap can never drive the segment negative, because it only
+    engages when the uncapped slope is steeper.
     """
     x0 = float(np.clip(x0, 1e-3, hi - 1e-3))
     y0 = float(np.clip(y0, 0.0, hi))
     out = np.empty_like(x)
     lo = x <= x0
-    out[lo] = y0 * (x[lo] / x0)
+
+    gain = y0 / x0
+    if max_gain is not None and gain > max_gain:
+        out[lo] = np.maximum(y0 - max_gain * (x0 - x[lo]), 0.0)
+    else:
+        out[lo] = y0 * (x[lo] / x0)
+
     out[~lo] = y0 + (hi - y0) * ((x[~lo] - x0) / max(hi - x0, 1e-6))
     return out
 
@@ -276,10 +412,24 @@ def rule_transform(ps: PixelSet, rule: RecolorRule) -> np.ndarray:
         c_new = np.clip(ps.C + ct, 0.0, CHROMA_MAX)
         h_out = np.full_like(ps.h, ht)
     else:
-        c_new = _anchored(ps.C, cs, ct, CHROMA_MAX)
+        c_new = _anchored(ps.C, cs, ct, CHROMA_MAX, max_gain=CHROMA_GAIN_MAX)
         hs = float(np.arctan2(bs, a_s))
         dh = float(np.angle(np.exp(1j * (ht - hs))))  # shortest signed rotation
-        h_out = ps.h + rule.hue_amount * dh
+        rotated = ps.h + rule.hue_amount * dh
+
+        # A near-neutral *pixel* has no meaningful hue either, whatever the
+        # source's chroma was: its h is 8-bit quantization noise around the
+        # neutral axis. Rotating that noise scatters hues across the wheel, and
+        # since c_new then lifts the pixel to the target's chroma, the noise
+        # comes back as fully saturated confetti -- a black material told to go
+        # red arriving as green speckle.
+        #
+        # Fade to the target hue as the pixel approaches neutral. Interpolated
+        # as unit vectors so the blend takes the short way round the circle
+        # instead of jumping at the +/-pi wrap.
+        gate = np.clip((ps.C - CHROMA_EPS) / 8.0, 0.0, 1.0)
+        blended = gate * np.exp(1j * rotated) + (1.0 - gate) * np.exp(1j * ht)
+        h_out = np.angle(blended).astype(np.float32)
 
     c_out = ps.C + rule.chroma_amount * (c_new - ps.C)
     c_out = np.clip(c_out, 0.0, CHROMA_MAX)
@@ -302,16 +452,39 @@ def apply_rules(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Composite every enabled rule. Returns ``(new_lab, coverage)``.
 
-    Rules are painter's-order: earlier rules keep the pixels they claim. Every
-    rule matches and transforms against the *original* pixels, so chaining
+    Rules layer like a stack: **a rule owns every pixel it writes to, outright.**
+    Once a rule has touched a pixel -- at any strength, however faintly -- no
+    rule below it in the list may write to that pixel again, in preview or in
+    export. A lower rule is not allowed to "top up" the share a higher rule left
+    unpainted; whatever the owning rule did not cover stays original art.
+
+    Two weaker models were tried first and both leaked. ``w * (1 - cov)`` let
+    every lower rule tint the soft share of the rule above, haloing every
+    feathered edge. Subtracting coverage (``w - cov``) fixed the fully-claimed
+    core but still let a broad rule fill in the remainder of a partial claim --
+    which is how a tight rule for the shoes, claiming its pixels at 0.09 to
+    0.99, ended up wearing the color of the suit rule beneath it.
+
+    A drawn ``region`` claims its whole area, not just the pixels the owning
+    rule matched, so a sloppy outline still shields everything inside it.
+
+    Every rule matches and transforms against the *original* pixels, so chaining
     red -> blue and then blue -> green cannot double-apply.
     """
     n = ps.lab.shape[0]
     accum = np.zeros((n, 3), dtype=np.float32)
     cov = np.zeros(n, dtype=np.float32)
+    # Pixels already owned by a rule above. Kept separate from ``cov``: a region
+    # locks its whole area, but the parts of it nobody painted must still
+    # resolve to the original art rather than to black.
+    locked = np.zeros(n, dtype=bool)
 
     for rule in rules:
         if not rule.enabled:
+            continue
+        if rule.opacity <= 0.0:
+            # Strength 0 means "off", so it must not claim pixels and block the
+            # rules underneath it.
             continue
 
         key = None
@@ -326,14 +499,29 @@ def apply_rules(
             if weight_cache is not None and key is not None:
                 weight_cache[key] = w
 
-        # Coverage never exceeds 1, so overlapping rules blend by priority
-        # instead of summing into something oversaturated.
-        w = np.clip(w * (1.0 - cov), 0.0, 1.0)
-        if not w.any():
+        # Below this a "write" is not visible at 8-bit, and a Gaussian tail from
+        # Smooth edges would otherwise lock a wide halo it never actually paints.
+        take = np.where((w > WRITE_EPS) & ~locked, w, 0.0).astype(np.float32)
+
+        # Claim territory even when nothing was painted this pass, so an empty
+        # or badly-aimed region still shields its area from the rules below.
+        if rule.region_active and shape is not None:
+            locked |= rule.region.mask(shape).reshape(-1)[ps.idx]
+
+        if not take.any():
             continue
 
-        accum += w[:, None] * rule_transform(ps, rule)
-        cov += w
+        # Strength blends this rule's own result toward the ORIGINAL pixel, not
+        # toward whatever is underneath, so turning a rule down reveals the
+        # source art rather than the next rule in the stack.
+        result = rule_transform(ps, rule)
+        opacity = float(rule.opacity)
+        if opacity < 1.0:
+            result = ps.lab + opacity * (result - ps.lab)
+
+        accum += take[:, None] * result
+        cov += take
+        locked |= take > 0.0
 
     new_lab = ps.lab * (1.0 - cov)[:, None] + accum
     return new_lab.astype(np.float32), cov

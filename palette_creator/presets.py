@@ -9,7 +9,7 @@ import numpy as np
 
 from .colorspace import hex_to_lab, lab_to_hex
 from .config import PRESETS_DIR
-from .recolor import MatchMode, RecolorRule
+from .recolor import MatchMode, RecolorRule, Region
 
 FORMAT_VERSION = 1
 
@@ -24,6 +24,7 @@ _FIELDS = (
     "opacity",
     "smooth_edges",
     "contiguous",
+    "match_all",
     "enabled",
     "lock_to_cluster",
     "name",
@@ -46,6 +47,13 @@ def rule_to_dict(rule: RecolorRule) -> dict:
         data["seed_uv"] = list(rule.seed_uv)
     if rule.cluster_id is not None:
         data["cluster_id"] = rule.cluster_id
+    if rule.region is not None:
+        # Normalized coords, so a preset drawn against a 1024px render still
+        # lands correctly on a differently-sized one.
+        data["region"] = {
+            "kind": rule.region.kind,
+            "points": [list(p) for p in rule.region.points],
+        }
     return data
 
 
@@ -63,6 +71,12 @@ def rule_from_dict(data: dict) -> RecolorRule:
     seed = data.get("seed_uv")
     rule.seed_uv = tuple(seed) if seed else None
     rule.cluster_id = data.get("cluster_id")
+    region = data.get("region")
+    if region:
+        rule.region = Region(
+            kind=region.get("kind", "rect"),
+            points=[tuple(p) for p in region.get("points", [])],
+        )
     return rule
 
 

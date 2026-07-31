@@ -12,6 +12,7 @@ from tkinter import filedialog, messagebox
 import customtkinter as ctk
 import numpy as np
 from PIL import Image
+from scipy import ndimage
 
 from ..colorspace import lab_to_hex, rgb8_to_lab, rgb_to_hex
 from ..config import EXPORT_DIR, KMEANS_DEFAULT_K, PRESETS_DIR
@@ -19,7 +20,7 @@ from ..imagectx import ContextCache
 from ..library import Library
 from ..palette_extract import Swatch, extract_palette, seed_for_path
 from ..presets import load_preset, save_preset
-from ..recolor import MatchMode, RecolorRule, render, rule_weight
+from ..recolor import MatchMode, RecolorRule, Region, render, rule_weight
 from .color_wheel import ColorEditor
 from .image_canvas import ImageCanvas
 from .rule_row import RuleRow
@@ -57,6 +58,9 @@ class RecolorTab(ctk.CTkFrame):
         self._alive = True
         self._pump_after: str | None = None
         self._auto_selection = False
+        self._pending_region: Region | None = None
+        """A drawn shape not yet attached to any rule. Held rather than applied
+        so drawing never mutates whichever rule happens to be selected."""
 
         self._undo_stack: list[tuple[str, list, int]] = []
         self._redo_stack: list[tuple[str, list, int]] = []
@@ -175,7 +179,7 @@ class RecolorTab(ctk.CTkFrame):
 
         bar = ctk.CTkFrame(panel, fg_color="transparent")
         bar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        bar.grid_columnconfigure(4, weight=1)
+        bar.grid_columnconfigure(5, weight=1)
 
         self._view = ctk.CTkSegmentedButton(
             bar,
@@ -200,8 +204,46 @@ class RecolorTab(ctk.CTkFrame):
             row=0, column=2, padx=2
         )
 
+        region_bar = ctk.CTkFrame(bar, fg_color="transparent")
+        region_bar.grid(row=0, column=3, padx=(10, 0), sticky="w")
+
+        self._region_btns: dict[str, ctk.CTkButton] = {}
+        for col, (mode, text, tip) in enumerate(
+            (
+                (
+                    "rect",
+                    "▭ Box",
+                    "Drag a box on the image to claim an area for one rule.\n\n"
+                    "The rule is confined to it, and it owns it: no rule below "
+                    "it in the list can paint inside, so a broad rule cannot "
+                    "creep back over a part you separated out.",
+                ),
+                (
+                    "lasso",
+                    "◌ Lasso",
+                    "Draw a freehand outline around a part. Released strokes "
+                    "close automatically.\n\n"
+                    "Same ownership as Box: rules below cannot paint inside it.",
+                ),
+            )
+        ):
+            btn = ctk.CTkButton(
+                region_bar, text=text, width=64, height=28,
+                command=lambda m=mode: self._toggle_draw_mode(m),
+            )
+            btn.grid(row=0, column=col, padx=1)
+            Tooltip(btn, tip)
+            self._region_btns[mode] = btn
+
+        self._clear_region_btn = ctk.CTkButton(
+            region_bar, text="Clear", width=52, height=28,
+            command=self._clear_region, state="disabled",
+        )
+        self._clear_region_btn.grid(row=0, column=2, padx=(4, 0))
+        Tooltip(self._clear_region_btn, "Remove the drawn region from this rule.")
+
         history = ctk.CTkFrame(bar, fg_color="transparent")
-        history.grid(row=0, column=3, padx=(10, 0), sticky="w")
+        history.grid(row=0, column=4, padx=(10, 0), sticky="w")
         self._undo_btn = ctk.CTkButton(
             history, text="↶", width=34, height=28, state="disabled",
             command=self.undo,
@@ -219,10 +261,12 @@ class RecolorTab(ctk.CTkFrame):
         self._hq = ctk.CTkLabel(
             bar, text="", font=FONT_MONO, width=110, anchor="e", text_color="#5fbf5f"
         )
-        self._hq.grid(row=0, column=4, sticky="e", padx=6)
+        self._hq.grid(row=0, column=5, sticky="e", padx=6)
         Tooltip(self._hq, "Lights up once the full-resolution render is displayed.")
 
-        self.canvas = ImageCanvas(panel, on_pick=self._on_canvas_pick)
+        self.canvas = ImageCanvas(
+            panel, on_pick=self._on_canvas_pick, on_region=self._on_region_drawn
+        )
         self.canvas.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
 
         self._status = ctk.CTkLabel(panel, text="", font=FONT_SMALL, anchor="w")
@@ -248,8 +292,15 @@ class RecolorTab(ctk.CTkFrame):
         add = ctk.CTkFrame(panel, fg_color="transparent")
         add.grid(row=1, column=0, sticky="ew", padx=10)
         add.grid_columnconfigure((0, 1), weight=1)
-        ctk.CTkButton(add, text="+ Add rule", height=28, command=self._add_rule).grid(
-            row=0, column=0, sticky="ew", padx=(0, 3)
+        self._add_rule_btn = ctk.CTkButton(
+            add, text="+ Add rule", height=28, command=self._add_rule
+        )
+        self._add_rule_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        Tooltip(
+            self._add_rule_btn,
+            "Adds a rule. With a Box or Lasso region drawn, the new rule is "
+            "confined to it and takes its source color from the dominant "
+            "material inside it.",
         )
         ctk.CTkButton(
             add, text="Clear all", height=28, fg_color="#5a3a3a",
@@ -364,34 +415,60 @@ class RecolorTab(ctk.CTkFrame):
         )
         self._opacity.grid(row=5, column=0, sticky="ew", pady=3)
 
+        self._apply_region_btn = ctk.CTkButton(
+            box, text="Apply region to this rule", height=28, state="disabled",
+            command=self._apply_region_to_rule,
+        )
+        self._apply_region_btn.grid(row=6, column=0, sticky="ew", pady=(8, 4))
+        Tooltip(
+            self._apply_region_btn,
+            "Confine the rule selected above to the region you just drew, "
+            "instead of making a new rule for it.",
+        )
+
+        self._match_all = ctk.CTkCheckBox(
+            box, text="Match all pixels", font=FONT_SMALL,
+            command=self._sync_rule_from_ui,
+        )
+        self._match_all.grid(row=7, column=0, sticky="w", pady=(4, 2))
+        Tooltip(
+            self._match_all,
+            "Ignore the drawn region and recolor every matching pixel in the "
+            "image.\n\n"
+            "Only does anything once you have drawn a Box or Lasso region; it "
+            "is the override for temporarily seeing the rule unconfined.",
+        )
+
         self._contiguous = ctk.CTkCheckBox(
             box, text="This region only", font=FONT_SMALL,
             command=self._sync_rule_from_ui,
         )
-        self._contiguous.grid(row=6, column=0, sticky="w", pady=(8, 2))
+        self._contiguous.grid(row=8, column=0, sticky="w", pady=2)
         Tooltip(
             self._contiguous,
-            "Restrict the rule to the connected region you clicked.\n\n"
-            "The game recolors by material, not by color, so two separate parts "
-            "can share a color. This is the way to separate them.",
+            "Restrict the rule to one connected blob -- the one you clicked, or "
+            "the largest one if the rule came from a palette swatch.\n\n"
+            "Weak on this game's renders: shading in 'material' mode usually "
+            "bridges separate parts into a single blob. Draw a Box or Lasso "
+            "region instead when this does not separate what you expect.",
         )
 
         self._smooth = ctk.CTkCheckBox(
             box, text="Smooth edges", font=FONT_SMALL, command=self._sync_rule_from_ui
         )
-        self._smooth.grid(row=7, column=0, sticky="w", pady=2)
+        self._smooth.grid(row=9, column=0, sticky="w", pady=2)
 
         self._lock_cluster = ctk.CTkCheckBox(
             box, text="Lock to palette swatch", font=FONT_SMALL,
             command=self._sync_rule_from_ui,
         )
-        self._lock_cluster.grid(row=8, column=0, sticky="w", pady=2)
+        self._lock_cluster.grid(row=10, column=0, sticky="w", pady=2)
 
         self._gamut = ctk.CTkCheckBox(
             box, text="Gamut safe", font=FONT_SMALL, command=self._request_preview
         )
         self._gamut.select()
-        self._gamut.grid(row=9, column=0, sticky="w", pady=2)
+        self._gamut.grid(row=11, column=0, sticky="w", pady=2)
         Tooltip(
             self._gamut,
             "Pull impossible colors back into sRGB by reducing saturation "
@@ -464,10 +541,14 @@ class RecolorTab(ctk.CTkFrame):
             return
 
         self._weight_cache.clear()
+        # A shape drawn against the previous render is not a decision the user
+        # made about this one.
+        self._pending_region = None
         h, w = self.ctx.shape_full
         self._file_label.configure(text=f"{path.name}\n{w} x {h}")
         self.canvas.set_frame(self.ctx.rgba_full, keep_view=False)
         self._extract_palette()
+        self._refresh_region_controls()
         self._request_preview()
         self._status.configure(text=f"Loaded {path.name}")
 
@@ -498,8 +579,145 @@ class RecolorTab(ctk.CTkFrame):
                 mode=MatchMode.MATERIAL,
                 tolerance=swatch.suggested_tolerance,
                 cluster_id=swatch.index,
+                seed_uv=self._seed_for_cluster(swatch),
             )
         )
+
+    def _seed_for_cluster(self, swatch: Swatch) -> tuple[float, float] | None:
+        """A representative pixel location for a cluster, in normalized coords.
+
+        Without this a swatch-built rule has no seed, which used to make "This
+        region only" a silent no-op for the entire palette workflow.
+        """
+        if self.ctx is None or self.ctx.clusters is None:
+            return None
+        ps = self.ctx.proxy
+        labels = self.ctx.clusters.labels_for(ps)
+        member = np.flatnonzero(labels == swatch.index)
+        if member.size == 0:
+            return None
+
+        h, w = self.ctx.shape_proxy
+
+        # Restrict to the cluster's largest connected blob first. A material
+        # scatters specks of its own color across the sheet, and seeding into
+        # one of those would make "This region only" keep the speck and discard
+        # the actual part.
+        plane = np.zeros(h * w, dtype=bool)
+        plane[ps.idx[member]] = True
+        labeled, count = ndimage.label(plane.reshape(h, w))
+        if count:
+            sizes = np.bincount(labeled.ravel())
+            sizes[0] = 0
+            biggest = labeled.reshape(-1)[ps.idx[member]] == int(np.argmax(sizes))
+            if biggest.any():
+                member = member[biggest]
+
+        # Then the member closest to the midtone -- the same color the rule
+        # matches on, so the seed avoids antialiased fringe pixels.
+        d = np.linalg.norm(ps.lab[member] - swatch.midtone_lab[None, :], axis=1)
+        flat = int(ps.idx[member[int(np.argmin(d))]])
+        y, x = divmod(flat, w)
+        return (x / max(w - 1, 1), y / max(h - 1, 1))
+
+    # -------------------------------------------------------------- regions
+
+    def _toggle_draw_mode(self, mode: str) -> None:
+        active = self.canvas.draw_mode != mode
+        self.canvas.set_draw_mode(mode if active else None)
+        if active:
+            self._set_eyedropper(False)  # one canvas gesture at a time
+        self._refresh_region_controls()
+        if active:
+            self._status.configure(
+                text=f"Drag on the image to draw a "
+                f"{'box' if mode == 'rect' else 'lasso'} region."
+            )
+
+    def _on_region_drawn(self, kind: str, points: list) -> None:
+        """Hold the drawn shape as *pending*, attached to no rule yet.
+
+        Drawing does not silently rewrite whatever rule happened to be selected;
+        the region is committed by "+ Add rule" (a new rule for that area) or by
+        "Apply region to this rule".
+        """
+        self._pending_region = Region(kind=kind, points=points)
+        self.canvas.set_draw_mode(None)
+        self._refresh_region_controls()
+        self._status.configure(
+            text="Region drawn. '+ Add rule' makes a rule for it, or "
+            "'Apply region to this rule' confines the selected rule."
+        )
+
+    def _consume_pending_region(self, rule: RecolorRule) -> bool:
+        """Move any pending region onto ``rule``. Returns whether one moved."""
+        if self._pending_region is None:
+            return False
+        rule.region = self._pending_region
+        rule.match_all = False  # a freshly drawn region is meant to apply
+        self._pending_region = None
+        return True
+
+    def _apply_region_to_rule(self) -> None:
+        if self.selected is None or self._pending_region is None:
+            return
+        self._push_undo("apply region to rule")
+        self._consume_pending_region(self.selected)
+        self._match_all.deselect()
+        self._refresh_region_controls()
+
+        # Show what the region actually selects before it recolors anything,
+        # rather than jumping straight to a changed image.
+        self._show_selection_view()
+        self._refresh_rows()
+        self._request_preview()
+        self._report_selection()
+
+    def _clear_region(self) -> None:
+        """Drop the pending shape if there is one, else the rule's own region."""
+        if self._pending_region is not None:
+            self._pending_region = None
+            self._refresh_region_controls()
+            self._status.configure(text="Discarded the drawn region.")
+            return
+
+        if self.selected is None or self.selected.region is None:
+            return
+        self._push_undo("clear region")
+        self.selected.region = None
+        self._refresh_region_controls()
+        self._refresh_rows()
+        self._request_preview()
+        self._report_selection()
+
+    def _refresh_region_controls(self) -> None:
+        """Keep the toolbar in step with the canvas mode and the selected rule."""
+        mode = self.canvas.draw_mode
+        theme = ctk.ThemeManager.theme["CTkButton"]
+        for name, btn in self._region_btns.items():
+            on = name == mode
+            btn.configure(
+                fg_color="#2e5f2e" if on else theme["fg_color"],
+                hover_color="#3a763a" if on else theme["hover_color"],
+            )
+
+        pending = self._pending_region is not None
+        own = self.selected is not None and self.selected.region is not None
+        self._clear_region_btn.configure(
+            state="normal" if (pending or own) else "disabled"
+        )
+        self._apply_region_btn.configure(
+            state="normal" if (pending and self.selected is not None) else "disabled"
+        )
+        self._add_rule_btn.configure(
+            text="+ Add rule for region" if pending else "+ Add rule"
+        )
+
+        # The pending shape wins on screen: it is the one awaiting a decision.
+        if pending:
+            self.canvas.set_region(self._pending_region)
+        else:
+            self.canvas.set_region(self.selected.region if self.selected else None)
 
     def _on_swatch_hover(self, swatch: Swatch | None) -> None:
         self._hover_swatch = swatch
@@ -555,6 +773,7 @@ class RecolorTab(ctk.CTkFrame):
             self._restoring = False
 
         self._coalesce_key = None
+        self._refresh_region_controls()
         self._request_preview()
         self._report_selection()
         self._update_history_buttons()
@@ -594,6 +813,15 @@ class RecolorTab(ctk.CTkFrame):
     def _add_rule(self) -> None:
         if self.ctx is None:
             return
+
+        # With a region pending, "add rule" means "a rule for that area", so the
+        # source color comes from inside it rather than from swatch 0.
+        if self._pending_region is not None:
+            rule = self._rule_for_region(self._pending_region)
+            if rule is not None:
+                self._append_rule(rule)
+                return
+
         source = (
             self.ctx.clusters.swatches[0].midtone_lab
             if self.ctx.clusters and self.ctx.clusters.swatches
@@ -601,8 +829,56 @@ class RecolorTab(ctk.CTkFrame):
         )
         self._append_rule(RecolorRule(source_lab=source, target_lab=source.copy()))
 
+    def _rule_for_region(self, region: Region) -> RecolorRule | None:
+        """Build a rule matching the dominant material inside ``region``.
+
+        The dominant *cluster* rather than a mean color: a mean over a region
+        spanning two materials is a blend that belongs to neither, whereas the
+        biggest cluster inside the box is the thing the user drew around, and it
+        brings its own measured tolerance with it.
+        """
+        ps = self.ctx.proxy
+        inside = region.mask(self.ctx.shape_proxy).reshape(-1)[ps.idx]
+        if not inside.any():
+            self._status.configure(text="That region contains no opaque pixels.")
+            return None
+
+        clusters = self.ctx.clusters
+        if clusters is None:
+            source = np.median(ps.lab[inside], axis=0).astype(np.float32)
+            return RecolorRule(source_lab=source, target_lab=source.copy())
+
+        labels = clusters.labels_for(ps)
+        index = int(np.argmax(np.bincount(labels[inside], minlength=clusters.k)))
+        swatch = clusters.swatch(index)
+        if swatch is None:
+            source = np.median(ps.lab[inside], axis=0).astype(np.float32)
+            return RecolorRule(source_lab=source, target_lab=source.copy())
+
+        return RecolorRule(
+            source_lab=swatch.midtone_lab,
+            target_lab=swatch.midtone_lab.copy(),
+            mode=MatchMode.MATERIAL,
+            tolerance=swatch.suggested_tolerance,
+            cluster_id=swatch.index,
+            seed_uv=self._seed_in_region(ps, inside, labels, swatch),
+        )
+
+    def _seed_in_region(self, ps, inside, labels, swatch) -> tuple[float, float] | None:
+        """Seed 'this region only' from a pixel inside the drawn area."""
+        member = np.flatnonzero(inside & (labels == swatch.index))
+        if member.size == 0:
+            return None
+        d = np.linalg.norm(ps.lab[member] - swatch.midtone_lab[None, :], axis=1)
+        h, w = self.ctx.shape_proxy
+        y, x = divmod(int(ps.idx[member[int(np.argmin(d))]]), w)
+        return (x / max(w - 1, 1), y / max(h - 1, 1))
+
     def _append_rule(self, rule: RecolorRule) -> None:
         self._push_undo("add rule")
+        # Any new rule created while a shape is pending is scoped to it, so the
+        # eyedropper and the palette swatches honour a drawn region too.
+        self._consume_pending_region(rule)
         self.rules.append(rule)
         self.selected = rule
         self._rebuild_rule_list()
@@ -637,13 +913,22 @@ class RecolorTab(ctk.CTkFrame):
         w = rule_weight(ps, rule, shape=self.ctx.shape_proxy)
         covered = float((w > 0.5).sum()) / max(len(ps), 1)
 
+        if rule.region is None:
+            note = ""
+        elif rule.match_all:
+            note = "  [region ignored - 'Match all pixels' is on]"
+        else:
+            note = f"  [owns its drawn {rule.region.kind}; rules below cannot paint there]"
+
         if rule.is_identity():
             self._status.configure(
-                text=f"Selected {covered * 100:.1f}% of the render. "
+                text=f"Selected {covered * 100:.1f}% of the render.{note} "
                 "Adjust Tolerance if needed, then pick a replacement color."
             )
         else:
-            self._status.configure(text=f"Rule covers {covered * 100:.1f}% of the render.")
+            self._status.configure(
+                text=f"Rule covers {covered * 100:.1f}% of the render.{note}"
+            )
 
     def _clear_rules(self) -> None:
         if self.rules and not messagebox.askyesno(
@@ -655,6 +940,7 @@ class RecolorTab(ctk.CTkFrame):
         self.selected = None
         self._weight_cache.clear()
         self._rebuild_rule_list()
+        self._refresh_region_controls()
         self._request_preview()
 
     def _rebuild_rule_list(self) -> None:
@@ -719,6 +1005,8 @@ class RecolorTab(ctk.CTkFrame):
         self._rebuild_rule_list()
         if self.selected is not None:
             self._sync_ui_from_rule()
+        else:
+            self._refresh_region_controls()
         self._request_preview()
 
     def _sync_ui_from_rule(self) -> None:
@@ -737,6 +1025,7 @@ class RecolorTab(ctk.CTkFrame):
                 (self._contiguous, rule.contiguous),
                 (self._smooth, rule.smooth_edges),
                 (self._lock_cluster, rule.lock_to_cluster),
+                (self._match_all, rule.match_all),
             ):
                 widget.select() if flag else widget.deselect()
             self._editor.set_color(
@@ -745,6 +1034,8 @@ class RecolorTab(ctk.CTkFrame):
             )
         finally:
             self._suspend_rule_sync = False
+
+        self._refresh_region_controls()
 
     def _sync_rule_from_ui(self) -> None:
         rule = self.selected
@@ -760,6 +1051,7 @@ class RecolorTab(ctk.CTkFrame):
         rule.contiguous = bool(self._contiguous.get())
         rule.smooth_edges = bool(self._smooth.get())
         rule.lock_to_cluster = bool(self._lock_cluster.get())
+        rule.match_all = bool(self._match_all.get())
         self._refresh_rows()
         self._request_preview()
         self._report_selection()
@@ -784,6 +1076,9 @@ class RecolorTab(ctk.CTkFrame):
         self._set_eyedropper(active)
 
     def _set_eyedropper(self, active: bool) -> None:
+        if active and self.canvas.draw_mode is not None:
+            self.canvas.set_draw_mode(None)
+            self._refresh_region_controls()
         self.canvas.set_eyedropper(active)
         self._eyedropper_btn.configure(
             fg_color="#2e5f2e" if active else ctk.ThemeManager.theme["CTkButton"]["fg_color"],

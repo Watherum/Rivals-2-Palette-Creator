@@ -20,10 +20,14 @@ from palette_creator.config import SOURCE_DIR
 from palette_creator.imagectx import load_context
 from palette_creator.palette_extract import extract_palette, seed_for_path
 from palette_creator.recolor import (
+    WRITE_EPS,
     MatchMode,
+    _anchored,
     RecolorRule,
+    Region,
     apply_rules,
     render,
+    rule_transform,
     rule_weight,
 )
 
@@ -71,6 +75,102 @@ def gradient_ctx(tmp_path):
     path = tmp_path / "grad.png"
     Image.fromarray(arr, "RGBA").save(path)
     return load_context(path)
+
+
+@pytest.fixture
+def neutral_ctx(tmp_path):
+    """A near-neutral dark ramp -- the shaded blacks and grays of a render.
+
+    Their hue is 8-bit quantization noise around the neutral axis, which is
+    exactly the input that used to come back as saturated confetti.
+    """
+    h = w = 64
+    arr = np.zeros((h, w, 4), np.uint8)
+    ramp = np.linspace(8, 150, h).astype(np.uint8)
+    rng = np.random.default_rng(0)
+    base = np.repeat(ramp[:, None], w, axis=1)
+    for c in range(3):  # +/-1 per channel: real renders are never exactly gray
+        arr[..., c] = np.clip(base + rng.integers(-1, 2, (h, w)), 0, 255)
+    arr[..., 3] = 255
+    path = tmp_path / "neutral.png"
+    Image.fromarray(arr, "RGBA").save(path)
+    return load_context(path)
+
+
+@pytest.mark.parametrize("source_hex", ["#848489", "#131413", "#661716", "#353735"])
+def test_near_neutral_pixels_do_not_get_random_hues(neutral_ctx, source_hex):
+    """Recoloring shaded grays must give one hue, not confetti.
+
+    ``rule_transform`` guarded a neutral *source* but rotated every pixel's own
+    hue regardless. A source just over CHROMA_EPS took the rotate branch, and
+    since the chroma remap then lifts near-neutral pixels to the target's
+    chroma, their meaningless hue came back fully saturated: a black material
+    told to go red arrived as green speckle.
+    """
+    rule = RecolorRule(
+        source_lab=hex_to_lab(source_hex),
+        target_lab=hex_to_lab("#FF0000"),
+        tolerance=60,
+    )
+    ps = neutral_ctx.full
+    out = rule_transform(ps, rule)
+    hue = np.arctan2(out[:, 2], out[:, 1])
+
+    resultant = np.abs(np.exp(1j * hue).mean())
+    spread = np.degrees(np.sqrt(max(-2.0 * np.log(max(resultant, 1e-9)), 0.0)))
+    assert spread < 10.0, f"hues spread over {spread:.0f} deg"
+
+    target_hue = np.arctan2(*hex_to_lab("#FF0000")[[2, 1]])
+    off = np.degrees(np.abs(np.angle(np.exp(1j * (hue - target_hue)))))
+    assert off.mean() < 15.0, f"mean hue is {off.mean():.0f} deg off the target"
+
+
+@pytest.mark.parametrize("source_hex", ["#848489", "#3A3D3A", "#5A5F5A"])
+def test_flat_material_does_not_come_back_grainy(neutral_ctx, source_hex):
+    """Recoloring a near-gray must not amplify its quantization noise.
+
+    The chroma remap rises at ``target_chroma / source_chroma`` below the
+    anchor. For a source just over CHROMA_EPS that is ~25x, so the +/-1 of 8-bit
+    noise in a flat gray came back as +/-28 of chroma -- visible speckle across
+    a material the user asked to be one solid color.
+    """
+    rule = RecolorRule(
+        source_lab=hex_to_lab(source_hex),
+        target_lab=hex_to_lab("#C80E3E"),
+        tolerance=60,
+    )
+    ps = neutral_ctx.full
+    out = rule_transform(ps, rule)
+    out_chroma = np.hypot(out[:, 1], out[:, 2])
+
+    amplification = out_chroma.std() / max(ps.C.std(), 1e-6)
+    assert amplification < 4.0, f"chroma noise amplified {amplification:.1f}x"
+
+
+def test_anchor_still_lands_on_target_under_the_gain_cap():
+    """Capping the gain must not move the anchor: that is the whole design."""
+    for x0, y0 in ((2.9, 71.7), (0.5, 90.0), (40.0, 71.7), (60.0, 10.0)):
+        x = np.array([0.0, x0 * 0.5, x0, x0 * 1.5, 128.0], np.float32)
+        out = _anchored(x, x0, y0, 128.0, max_gain=2.0)
+        assert out[2] == pytest.approx(y0, abs=1e-3)
+        assert out[-1] == pytest.approx(128.0, abs=1e-3)
+        assert np.all(np.diff(out) >= -1e-4), "remap must stay monotone"
+        assert np.all(out >= -1e-6), "remap must stay non-negative"
+
+
+def test_saturated_pixels_still_rotate_rather_than_flatten(gradient_ctx):
+    """The neutral fallback must not swallow genuine hue variation."""
+    rule = RecolorRule(
+        source_lab=rgb8_to_lab((0, 0, 140)),
+        target_lab=hex_to_lab("#FF0000"),
+        tolerance=60,
+    )
+    ps = gradient_ctx.full
+    strong = ps.C > 30
+    assert strong.sum() > 50
+    out = rule_transform(ps, rule)[strong]
+    hue = np.arctan2(out[:, 2], out[:, 1])
+    assert np.degrees(np.ptp(hue)) > 1.0, "hue variation was flattened away"
 
 
 def test_identity_rule_is_byte_identical(gradient_ctx):
@@ -215,6 +315,153 @@ def test_rules_do_not_cascade(gradient_ctx):
     assert claimed.size > 100
     assert np.array_equal(
         only_first.reshape(-1, 4)[claimed], both.reshape(-1, 4)[claimed]
+    )
+
+
+def test_lower_rule_is_invisible_under_an_identical_one(gradient_ctx):
+    """A rule selecting the same material as one above it must not show at all.
+
+    The old ``w * (1 - cov)`` composite let the lower rule tint whatever the
+    rule above had left soft -- a visible halo everywhere the top rule feathered.
+    """
+    src = rgb8_to_lab((200, 0, 0))
+    top = RecolorRule(source_lab=src, target_lab=hex_to_lab("#0000C8"), tolerance=30)
+    bottom = RecolorRule(source_lab=src, target_lab=hex_to_lab("#00C800"), tolerance=30)
+
+    only_top = render(gradient_ctx, [top], use_proxy=False)
+    both = render(gradient_ctx, [top, bottom], use_proxy=False)
+    assert np.array_equal(only_top, both)
+
+
+def test_strength_reveals_the_original_not_the_rule_below(gradient_ctx):
+    """Turning a rule down must show the source art, not the next rule down."""
+    src = rgb8_to_lab((200, 0, 0))
+    faint = RecolorRule(
+        source_lab=src, target_lab=hex_to_lab("#0000C8"), tolerance=30, opacity=0.5
+    )
+    bottom = RecolorRule(source_lab=src, target_lab=hex_to_lab("#00C800"), tolerance=30)
+
+    alone = render(gradient_ctx, [faint], use_proxy=False)
+    stacked = render(gradient_ctx, [faint, bottom], use_proxy=False)
+    assert np.array_equal(alone, stacked)
+
+
+def test_zero_strength_does_not_block_the_rule_below(gradient_ctx):
+    """Strength 0 means off, so it must not claim pixels it does nothing to."""
+    src = rgb8_to_lab((200, 0, 0))
+    off = RecolorRule(
+        source_lab=src, target_lab=hex_to_lab("#0000C8"), tolerance=30, opacity=0.0
+    )
+    live = RecolorRule(source_lab=src, target_lab=hex_to_lab("#00C800"), tolerance=30)
+
+    assert np.array_equal(
+        render(gradient_ctx, [off, live], use_proxy=False),
+        render(gradient_ctx, [live], use_proxy=False),
+    )
+
+
+def test_lower_rule_still_gets_what_the_top_did_not_select(gradient_ctx):
+    """Priority must not degenerate into 'only the first rule ever applies'."""
+    top = RecolorRule(
+        source_lab=rgb8_to_lab((200, 0, 0)), target_lab=hex_to_lab("#0000C8"),
+        tolerance=12,
+    )
+    bottom = RecolorRule(
+        source_lab=rgb8_to_lab((0, 0, 200)), target_lab=hex_to_lab("#00C800"),
+        tolerance=12,
+    )
+    only_top = render(gradient_ctx, [top], use_proxy=False)
+    both = render(gradient_ctx, [top, bottom], use_proxy=False)
+    assert not np.array_equal(only_top, both)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {},
+        {"opacity": 0.15},
+        {"feather": 1.0},
+        {"smooth_edges": True},
+        {"tolerance": 90},
+        {"region": Region("rect", [(0.0, 0.0), (0.5, 1.0)])},
+    ],
+    ids=["plain", "faint", "feathered", "smoothed", "wide", "region"],
+)
+def test_a_rule_owns_every_pixel_it_writes(gradient_ctx, kw):
+    """No rule may write to a pixel a rule above it already wrote to.
+
+    Not "may not overwrite" and not "may not exceed the remaining share" --
+    may not write at all, at any strength, in preview or export.
+    """
+    src = rgb8_to_lab((200, 0, 0))
+    base = dict(source_lab=src, target_lab=hex_to_lab("#0000C8"), tolerance=12)
+    top = RecolorRule(**{**base, **kw})
+    # Deliberately greedy: matches everything the top rule does, and much more.
+    bottom = RecolorRule(
+        source_lab=src, target_lab=hex_to_lab("#00C800"), tolerance=120
+    )
+
+    ps = gradient_ctx.full
+    shape = gradient_ctx.shape_full
+    owned = rule_weight(ps, top, shape=shape) > WRITE_EPS
+    if top.region_active:
+        owned |= top.region.mask(shape).reshape(-1)[ps.idx]
+    assert owned.sum() > 100, "test rule must own something to be meaningful"
+
+    alone = render(gradient_ctx, [top], use_proxy=False).reshape(-1, 4)
+    stacked = render(gradient_ctx, [top, bottom], use_proxy=False).reshape(-1, 4)
+    idx = ps.idx[owned]
+    assert np.array_equal(alone[idx], stacked[idx])
+
+
+def test_region_is_exclusive_territory(gradient_ctx):
+    """A drawn region shields its area from every rule below it.
+
+    The real case: a tight rule for the shoes claims most shoe pixels only
+    partially, and a broad rule for the suit underneath topped up the remainder
+    and recolored the shoes anyway.
+    """
+    src = rgb8_to_lab((200, 0, 0))
+    owner = RecolorRule(
+        source_lab=src,
+        target_lab=hex_to_lab("#0000C8"),
+        tolerance=2,  # deliberately too tight to claim its area fully
+        region=Region("rect", [(0.0, 0.0), (0.5, 1.0)]),
+    )
+    greedy = RecolorRule(
+        source_lab=src, target_lab=hex_to_lab("#00C800"), tolerance=90
+    )
+
+    alone = render(gradient_ctx, [owner], use_proxy=False)
+    stacked = render(gradient_ctx, [owner, greedy], use_proxy=False)
+
+    ps = gradient_ctx.full
+    inside = owner.region.mask(gradient_ctx.shape_full).reshape(-1)[ps.idx]
+    assert inside.sum() > 100
+    idx = ps.idx[inside]
+    assert np.array_equal(alone.reshape(-1, 4)[idx], stacked.reshape(-1, 4)[idx])
+
+    # ...and the lower rule is untouched everywhere outside it.
+    outside = ps.idx[~inside]
+    only_greedy = render(gradient_ctx, [greedy], use_proxy=False)
+    assert np.array_equal(
+        only_greedy.reshape(-1, 4)[outside], stacked.reshape(-1, 4)[outside]
+    )
+
+
+def test_region_does_not_shield_rules_above_it(gradient_ctx):
+    """Ownership runs down the stack only; reordering stays the escape hatch."""
+    src = rgb8_to_lab((200, 0, 0))
+    owner = RecolorRule(
+        source_lab=src, target_lab=hex_to_lab("#0000C8"), tolerance=2,
+        region=Region("rect", [(0.0, 0.0), (0.5, 1.0)]),
+    )
+    greedy = RecolorRule(
+        source_lab=src, target_lab=hex_to_lab("#00C800"), tolerance=90
+    )
+    assert not np.array_equal(
+        render(gradient_ctx, [owner, greedy], use_proxy=False),
+        render(gradient_ctx, [greedy, owner], use_proxy=False),
     )
 
 
