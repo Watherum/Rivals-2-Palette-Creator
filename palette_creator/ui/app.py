@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import tkinter as tk
 import traceback
 from tkinter import messagebox
 
@@ -20,8 +21,9 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title(f"Rivals 2 Palette Creator {__version__}")
-        self.geometry("1480x920")
+        self.geometry("1480x920")  # what restoring down returns to
         self.minsize(1180, 760)
+        self.after(0, self._maximize)
 
         self.tabs = ctk.CTkTabview(self, anchor="nw")
         self.tabs.pack(fill="both", expand=True, padx=8, pady=8)
@@ -37,6 +39,23 @@ class App(ctk.CTk):
         self.report_callback_exception = self._on_tk_error
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._bind_shortcuts()
+
+    def _maximize(self) -> None:
+        """Open maximized. Deferred by one tick so the window exists first.
+
+        'zoomed' is the Windows and macOS spelling; X11 window managers want
+        the -zoomed attribute instead, and on the ones that support neither an
+        ordinary 1480x920 window is a fine outcome -- not a crash on startup.
+        """
+        for attempt in (
+            lambda: self.state("zoomed"),
+            lambda: self.attributes("-zoomed", True),
+        ):
+            try:
+                attempt()
+                return
+            except tk.TclError:
+                continue
 
     def _bind_shortcuts(self) -> None:
         """Global undo/redo.

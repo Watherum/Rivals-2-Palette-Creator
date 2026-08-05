@@ -13,8 +13,11 @@ CHECKER_DARK = (58, 58, 62)
 CHECKER_SIZE = 12
 
 
-def _checkerboard(h: int, w: int) -> np.ndarray:
-    yy, xx = np.mgrid[0:h, 0:w]
+def _checkerboard(h: int, w: int, y0: int = 0, x0: int = 0) -> np.ndarray:
+    """``h`` x ``w`` of checkerboard, phased as if cut from a board whose
+    origin is at image pixel (0, 0) -- so a cropped tile lines up with its
+    neighbours instead of restarting the pattern."""
+    yy, xx = np.mgrid[y0 : y0 + h, x0 : x0 + w]
     on = ((yy // CHECKER_SIZE) + (xx // CHECKER_SIZE)) % 2 == 0
     board = np.empty((h, w, 3), np.uint8)
     board[on] = CHECKER_LIGHT
@@ -22,12 +25,18 @@ def _checkerboard(h: int, w: int) -> np.ndarray:
     return board
 
 
-def composite_over_checker(rgba: np.ndarray) -> np.ndarray:
-    """Flatten RGBA onto a checkerboard so transparency is visible."""
+def composite_over_checker(
+    rgba: np.ndarray, y0: int = 0, x0: int = 0
+) -> np.ndarray:
+    """Flatten RGBA onto a checkerboard so transparency is visible.
+
+    ``y0``/``x0`` are the crop's origin in the full image, and only shift the
+    checker's phase.
+    """
     h, w = rgba.shape[:2]
     a = rgba[..., 3:4].astype(np.float32) / 255.0
     rgb = rgba[..., :3].astype(np.float32)
-    board = _checkerboard(h, w).astype(np.float32)
+    board = _checkerboard(h, w, y0, x0).astype(np.float32)
     return np.rint(rgb * a + board * (1.0 - a)).astype(np.uint8)
 
 
@@ -40,11 +49,15 @@ class ImageCanvas(tk.Frame):
         *,
         on_pick: Callable[[int, int, str], None] | None = None,
         on_region: Callable[[str, list], None] | None = None,
+        on_view: Callable[[int, int, float], None] | None = None,
         **kw,
     ):
         super().__init__(master, bd=0, highlightthickness=0, **kw)
         self.on_pick = on_pick
         self.on_region = on_region
+        self.on_view = on_view
+        """Called with (width, height, zoom) of the image as displayed, after
+        every render -- zoom, fit, resize or a new frame."""
 
         self.canvas = tk.Canvas(
             self, highlightthickness=0, bd=0, bg="#1b1b1b", cursor="arrow"
@@ -78,10 +91,17 @@ class ImageCanvas(tk.Frame):
     # -- content ------------------------------------------------------------
 
     def set_frame(self, rgba: np.ndarray, *, keep_view: bool = True) -> None:
-        first = self._frame is None or self._frame.shape != rgba.shape
+        old = self._frame
         self._frame = rgba
-        if first or not keep_view:
+
+        if old is None or not keep_view:
             self._fit_pending = True
+        elif old.shape[:2] != rgba.shape[:2]:
+            # The same render at a different resolution -- the proxy standing in
+            # mid-edit, then the full-resolution pass replacing it. Rescale the
+            # zoom so what is on screen stays exactly where it was: refitting
+            # here would throw away the user's zoom and pan on every edit.
+            self._zoom *= old.shape[1] / rgba.shape[1]
         self._render()
 
     def clear(self) -> None:
@@ -96,7 +116,22 @@ class ImageCanvas(tk.Frame):
         self._render()
 
     def zoom_to(self, factor: float) -> None:
-        self._zoom = float(np.clip(factor, 0.05, 16.0))
+        """Zoom about the middle of the viewport.
+
+        Which is what a zoom control away from the image should do: the wheel
+        has a cursor to pin, this does not, and pinning the image's top-left
+        instead would throw the subject off the bottom-right as you zoom in.
+        """
+        new = float(np.clip(factor, 0.05, 16.0))
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        if self._frame is not None and self._zoom > 0:
+            mx = (cw / 2.0 - self._offset[0]) / self._zoom
+            my = (ch / 2.0 - self._offset[1]) / self._zoom
+            self._offset[0] = cw / 2.0 - mx * new
+            self._offset[1] = ch / 2.0 - my * new
+
+        self._zoom = new
         self._fit_pending = False
         self._center_if_smaller()
         self._render()
@@ -179,6 +214,11 @@ class ImageCanvas(tk.Frame):
     def zoom(self) -> float:
         return self._zoom
 
+    @property
+    def frame_width(self) -> int | None:
+        """Width of the frame on display, which is the proxy's mid-edit."""
+        return None if self._frame is None else int(self._frame.shape[1])
+
     def _compute_fit(self) -> None:
         if self._frame is None:
             return
@@ -215,10 +255,31 @@ class ImageCanvas(tk.Frame):
             self._fit_pending = False
 
         ih, iw = self._frame.shape[:2]
-        dw = max(int(round(iw * self._zoom)), 1)
-        dh = max(int(round(ih * self._zoom)), 1)
+        full_w = max(int(round(iw * self._zoom)), 1)
+        full_h = max(int(round(ih * self._zoom)), 1)
 
-        flat = composite_over_checker(self._frame)
+        # Only the part of the image inside the viewport is scaled. Scaling the
+        # whole thing costs with the square of the zoom -- 2.5 s and ~800 MB at
+        # 16x on a 1024px render -- while the visible area never exceeds the
+        # canvas, so this keeps a render flat in cost at any zoom.
+        x0 = max(int(np.floor(-self._offset[0] / self._zoom)), 0)
+        y0 = max(int(np.floor(-self._offset[1] / self._zoom)), 0)
+        x1 = min(int(np.ceil((cw - self._offset[0]) / self._zoom)) + 1, iw)
+        y1 = min(int(np.ceil((ch - self._offset[1]) / self._zoom)) + 1, ih)
+
+        self.canvas.delete("all")
+        if x1 <= x0 or y1 <= y0:  # panned entirely off screen
+            self._photo = None
+            self._draw_overlay()
+            if self.on_view is not None:
+                self.on_view(full_w, full_h, self._zoom)
+            return
+
+        crop = self._frame[y0:y1, x0:x1]
+        dw = max(int(round((x1 - x0) * self._zoom)), 1)
+        dh = max(int(round((y1 - y0) * self._zoom)), 1)
+
+        flat = composite_over_checker(crop, y0, x0)
         # Nearest above 1:1 so zooming in shows real pixels, not a blur.
         resample = (
             Image.Resampling.NEAREST if self._zoom >= 1.0 else Image.Resampling.LANCZOS
@@ -226,11 +287,18 @@ class ImageCanvas(tk.Frame):
         img = Image.fromarray(flat, "RGB").resize((dw, dh), resample)
 
         self._photo = ImageTk.PhotoImage(img)  # strong ref required
-        self.canvas.delete("all")
         self.canvas.create_image(
-            self._offset[0], self._offset[1], anchor="nw", image=self._photo
+            self._offset[0] + x0 * self._zoom,
+            self._offset[1] + y0 * self._zoom,
+            anchor="nw",
+            image=self._photo,
         )
         self._draw_overlay()
+
+        if self.on_view is not None:
+            # The whole image's size, not the visible crop's: callers ask how
+            # big the render is on screen, not how much of it fits.
+            self.on_view(full_w, full_h, self._zoom)
 
     # -- coordinate mapping -------------------------------------------------
 

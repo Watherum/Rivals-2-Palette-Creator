@@ -183,7 +183,7 @@ class ColorEditor(ctk.CTkFrame):
             fmt="{:.2f}",
             command=self._on_value,
         )
-        self._value.grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 6))
+        self._value.grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 10))
 
         row = ctk.CTkFrame(self, fg_color="transparent")
         row.grid(row=2, column=0, sticky="ew", padx=8)
@@ -199,7 +199,7 @@ class ColorEditor(ctk.CTkFrame):
         self._hex.bind("<Key>", lambda _e: setattr(self, "_last_typed", "hex"), add="+")
 
         rgb_row = ctk.CTkFrame(self, fg_color="transparent")
-        rgb_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(6, 0))
+        rgb_row.grid(row=3, column=0, sticky="ew", padx=8, pady=(10, 0))
         self._rgb_entries = []
         for i, label in enumerate(("R", "G", "B")):
             rgb_row.grid_columnconfigure(i * 2 + 1, weight=1)
@@ -218,7 +218,7 @@ class ColorEditor(ctk.CTkFrame):
             text="System picker...",
             height=28,
             command=self._open_system_picker,
-        ).grid(row=4, column=0, sticky="ew", padx=8, pady=(8, 4))
+        ).grid(row=4, column=0, sticky="ew", padx=8, pady=(10, 5))
 
         self._apply_btn = ctk.CTkButton(
             self,
@@ -228,7 +228,7 @@ class ColorEditor(ctk.CTkFrame):
             hover_color="#3a763a",
             command=self.apply,
         )
-        self._apply_btn.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self._apply_btn.grid(row=5, column=0, sticky="ew", padx=8, pady=(5, 8))
 
         self.set_color((255, 255, 255), "init")
 

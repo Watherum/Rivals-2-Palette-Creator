@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-from ..colorspace import lab_to_hex, rgb8_to_lab, rgb_to_hex
+from ..colorspace import hex_to_rgb, lab_to_hex, rgb8_to_lab, rgb_to_hex
 from ..config import EXPORT_DIR, KMEANS_DEFAULT_K, PRESETS_DIR
 from ..imagectx import ContextCache
 from ..library import Library
@@ -24,11 +24,16 @@ from ..recolor import MatchMode, RecolorRule, Region, render, rule_weight
 from .color_wheel import ColorEditor
 from .image_canvas import ImageCanvas
 from .rule_row import RuleRow
-from .swatch_grid import SwatchGrid
+from .swatch_grid import SwatchStrip
 from .widgets import FONT_MONO, FONT_SMALL, LabeledSlider, Swatch as ChipSwatch, Tooltip, section_label
 
 SETTLE_MS = 250
 """How long after the last input before the full-resolution pass runs."""
+
+ZOOM_LOG_MIN = -4.0
+ZOOM_LOG_MAX = 4.0
+"""Zoom slider range, in doublings: 6% to 1600%. Log-spaced because the useful
+range below 1:1 is a sixteenth of a linear track and would be unusable."""
 
 UNDO_LIMIT = 100
 COALESCE_S = 1.0
@@ -49,12 +54,16 @@ class RecolorTab(ctk.CTkFrame):
 
         self._rows: list[RuleRow] = []
         self._weight_cache: dict = {}
+        self._palette_params: tuple[int, bool] | None = None
+        """(k, group_neutrals) behind the left grid, so the replacement strip
+        can tell whether it would be asking k-means the same question."""
         self._preview_dirty = False
         self._settle_after: str | None = None
         self._showing_hq = False
         self._hover_swatch: Swatch | None = None
         self._view_mode = "Preview"
         self._suspend_rule_sync = False
+        self._suspend_zoom_sync = False
         self._alive = True
         self._pump_after: str | None = None
         self._auto_selection = False
@@ -94,48 +103,35 @@ class RecolorTab(ctk.CTkFrame):
     # ------------------------------------------------------------------ left
 
     def _build_left(self) -> None:
-        panel = ctk.CTkFrame(self, width=290)
+        """Everything that decides *what* gets recolored.
+
+        Source render, the palette it was extracted into, the canvas gestures
+        that pick pixels, and the matching controls -- one column, read top to
+        bottom. The right panel answers the other question, what to change the
+        selection *to*.
+        """
+        panel = ctk.CTkFrame(self, width=300)
         panel.grid(row=0, column=0, sticky="nsw", padx=(8, 4), pady=8)
         panel.grid_propagate(False)
         panel.grid_columnconfigure(0, weight=1)
-        panel.grid_rowconfigure(9, weight=1)
+        panel.grid_rowconfigure(1, weight=1)
 
-        section_label(panel, "Source render").grid(
-            row=0, column=0, sticky="ew", padx=10, pady=(10, 6)
+        self._build_source_picker(panel).grid(row=0, column=0, sticky="ew")
+
+        # The palette and the matching controls share one scroll region. Stacked
+        # they are taller than the window at its minimum size, and a control you
+        # cannot reach at all is worse than one you have to scroll to. The file
+        # picker above stays put -- it is how you get here in the first place.
+        body = ctk.CTkScrollableFrame(panel, fg_color="transparent")
+        body.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 6))
+        body.grid_columnconfigure(0, weight=1)
+
+        section_label(body, "Extracted palette").grid(
+            row=0, column=0, sticky="ew", padx=6, pady=(4, 4)
         )
 
-        self._character = ctk.CTkOptionMenu(
-            panel, values=["(scanning...)"], command=self._on_character
-        )
-        self._character.grid(row=1, column=0, sticky="ew", padx=10, pady=3)
-
-        self._skin = ctk.CTkOptionMenu(panel, values=["-"], command=self._on_skin)
-        self._skin.grid(row=2, column=0, sticky="ew", padx=10, pady=3)
-
-        self._palette = ctk.CTkOptionMenu(panel, values=["-"], command=self._on_palette)
-        self._palette.grid(row=3, column=0, sticky="ew", padx=10, pady=3)
-
-        self._file_label = ctk.CTkLabel(
-            panel, text="", font=FONT_MONO, anchor="w", wraplength=260, justify="left"
-        )
-        self._file_label.grid(row=4, column=0, sticky="ew", padx=10, pady=(6, 0))
-
-        self._lib_label = ctk.CTkLabel(
-            panel, text="", font=FONT_SMALL, anchor="w", text_color="#999",
-            wraplength=260, justify="left",
-        )
-        self._lib_label.grid(row=5, column=0, sticky="ew", padx=10, pady=(2, 6))
-
-        ctk.CTkButton(
-            panel, text="Refresh library", height=28, command=self.refresh_library
-        ).grid(row=6, column=0, sticky="ew", padx=10, pady=(0, 10))
-
-        section_label(panel, "Extracted palette").grid(
-            row=7, column=0, sticky="ew", padx=10, pady=(4, 4)
-        )
-
-        controls = ctk.CTkFrame(panel, fg_color="transparent")
-        controls.grid(row=8, column=0, sticky="ew", padx=10)
+        controls = ctk.CTkFrame(body, fg_color="transparent")
+        controls.grid(row=1, column=0, sticky="ew", padx=6)
         controls.grid_columnconfigure(0, weight=1)
 
         self._k_slider = LabeledSlider(
@@ -163,11 +159,59 @@ class RecolorTab(ctk.CTkFrame):
             "not spent on shades of gray.",
         )
 
-        self._swatches = SwatchGrid(
-            panel, on_select=self._on_swatch_click, on_hover=self._on_swatch_hover
+        self._swatches = SwatchStrip(
+            body,
+            on_select=self._on_swatch_click,
+            on_hover=self._on_swatch_hover,
+            flag_spans=True,
+            tooltip_suffix="Click to make a rule for this color.",
+            fg_color="transparent",
         )
-        self._swatches.grid(row=9, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self._swatches.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 4))
         self._swatches.show_message("Load a render to extract its palette.")
+
+        section_label(body, "Selection").grid(
+            row=3, column=0, sticky="ew", padx=6, pady=(10, 4)
+        )
+        self._build_selection_controls(body).grid(
+            row=4, column=0, sticky="ew", padx=6, pady=(0, 8)
+        )
+
+    def _build_source_picker(self, parent) -> ctk.CTkFrame:
+        box = ctk.CTkFrame(parent, fg_color="transparent")
+        box.grid_columnconfigure(0, weight=1)
+
+        section_label(box, "Source render").grid(
+            row=0, column=0, sticky="ew", padx=10, pady=(10, 6)
+        )
+
+        self._character = ctk.CTkOptionMenu(
+            box, values=["(scanning...)"], command=self._on_character
+        )
+        self._character.grid(row=1, column=0, sticky="ew", padx=10, pady=3)
+
+        self._skin = ctk.CTkOptionMenu(box, values=["-"], command=self._on_skin)
+        self._skin.grid(row=2, column=0, sticky="ew", padx=10, pady=3)
+
+        self._palette = ctk.CTkOptionMenu(box, values=["-"], command=self._on_palette)
+        self._palette.grid(row=3, column=0, sticky="ew", padx=10, pady=3)
+
+        self._file_label = ctk.CTkLabel(
+            box, text="", font=FONT_MONO, anchor="w", wraplength=268, justify="left"
+        )
+        self._file_label.grid(row=4, column=0, sticky="ew", padx=10, pady=(6, 0))
+
+        self._lib_label = ctk.CTkLabel(
+            box, text="", font=FONT_SMALL, anchor="w", text_color="#999",
+            wraplength=268, justify="left",
+        )
+        self._lib_label.grid(row=5, column=0, sticky="ew", padx=10, pady=(2, 6))
+
+        ctk.CTkButton(
+            box, text="Refresh library", height=28, command=self.refresh_library
+        ).grid(row=6, column=0, sticky="ew", padx=10, pady=(0, 8))
+
+        return box
 
     # ---------------------------------------------------------------- center
 
@@ -177,9 +221,11 @@ class RecolorTab(ctk.CTkFrame):
         panel.grid_columnconfigure(0, weight=1)
         panel.grid_rowconfigure(1, weight=1)
 
+        # View and history only. The tools that pick pixels live in the left
+        # panel next to the rest of the selection controls.
         bar = ctk.CTkFrame(panel, fg_color="transparent")
         bar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        bar.grid_columnconfigure(5, weight=1)
+        bar.grid_columnconfigure(4, weight=1)
 
         self._view = ctk.CTkSegmentedButton(
             bar,
@@ -189,61 +235,14 @@ class RecolorTab(ctk.CTkFrame):
         self._view.set("Preview")
         self._view.grid(row=0, column=0, sticky="w")
 
-        self._eyedropper_btn = ctk.CTkButton(
-            bar, text="Eyedropper", width=100, height=28, command=self._toggle_eyedropper
+        self._fit_btn = ctk.CTkButton(
+            bar, text="Fit", width=48, height=28, command=self._fit
         )
-        self._eyedropper_btn.grid(row=0, column=1, padx=(8, 2))
-        Tooltip(
-            self._eyedropper_btn,
-            "Click the image to set the selected rule's source color.\n"
-            "Shift+click samples one exact pixel instead of a 3x3 median.\n"
-            "Ctrl+click sets the TARGET color from the image.",
-        )
-
-        ctk.CTkButton(bar, text="Fit", width=48, height=28, command=self._fit).grid(
-            row=0, column=2, padx=2
-        )
-
-        region_bar = ctk.CTkFrame(bar, fg_color="transparent")
-        region_bar.grid(row=0, column=3, padx=(10, 0), sticky="w")
-
-        self._region_btns: dict[str, ctk.CTkButton] = {}
-        for col, (mode, text, tip) in enumerate(
-            (
-                (
-                    "rect",
-                    "▭ Box",
-                    "Drag a box on the image to claim an area for one rule.\n\n"
-                    "The rule is confined to it, and it owns it: no rule below "
-                    "it in the list can paint inside, so a broad rule cannot "
-                    "creep back over a part you separated out.",
-                ),
-                (
-                    "lasso",
-                    "◌ Lasso",
-                    "Draw a freehand outline around a part. Released strokes "
-                    "close automatically.\n\n"
-                    "Same ownership as Box: rules below cannot paint inside it.",
-                ),
-            )
-        ):
-            btn = ctk.CTkButton(
-                region_bar, text=text, width=64, height=28,
-                command=lambda m=mode: self._toggle_draw_mode(m),
-            )
-            btn.grid(row=0, column=col, padx=1)
-            Tooltip(btn, tip)
-            self._region_btns[mode] = btn
-
-        self._clear_region_btn = ctk.CTkButton(
-            region_bar, text="Clear", width=52, height=28,
-            command=self._clear_region, state="disabled",
-        )
-        self._clear_region_btn.grid(row=0, column=2, padx=(4, 0))
-        Tooltip(self._clear_region_btn, "Remove the drawn region from this rule.")
+        self._fit_btn.grid(row=0, column=1, padx=(8, 0))
 
         history = ctk.CTkFrame(bar, fg_color="transparent")
-        history.grid(row=0, column=4, padx=(10, 0), sticky="w")
+        history.grid(row=0, column=2, padx=(10, 0), sticky="w")
+        self._history_group = history
         self._undo_btn = ctk.CTkButton(
             history, text="↶", width=34, height=28, state="disabled",
             command=self.undo,
@@ -258,30 +257,132 @@ class RecolorTab(ctk.CTkFrame):
         self._redo_btn.grid(row=0, column=1, padx=1)
         Tooltip(self._redo_btn, "Redo   (Ctrl+R, or Ctrl+Y)")
 
-        self._hq = ctk.CTkLabel(
-            bar, text="", font=FONT_MONO, width=110, anchor="e", text_color="#5fbf5f"
+        files = ctk.CTkFrame(bar, fg_color="transparent")
+        files.grid(row=0, column=3, padx=(12, 0), sticky="w")
+        self._file_actions = files
+        for col, (text, width, command, tip) in enumerate(
+            (
+                (
+                    "Export", 62, self._export,
+                    "Write the recolored render straight to the next free "
+                    "Custom slot for this character.",
+                ),
+                (
+                    "Export As...", 76, self._export_as,
+                    "Write the recolored render to a path you pick.",
+                ),
+                (
+                    "Save preset", 76, self._save_preset,
+                    "Save the current rules to a file, to reuse on another "
+                    "render or another skin.",
+                ),
+                (
+                    "Load preset", 76, self._load_preset,
+                    "Replace the current rules with a saved set.",
+                ),
+            )
+        ):
+            btn = ctk.CTkButton(
+                files, text=text, width=width, height=28, command=command
+            )
+            btn.grid(row=0, column=col, padx=(0 if col == 0 else 3, 0))
+            Tooltip(btn, tip)
+
+        zoom_box = ctk.CTkFrame(bar, fg_color="transparent")
+        zoom_box.grid(row=0, column=4, sticky="e", padx=(12, 0))
+        self._zoom_box = zoom_box
+
+        ctk.CTkLabel(zoom_box, text="Zoom", font=FONT_SMALL, anchor="e").grid(
+            row=0, column=0, padx=(0, 6)
         )
-        self._hq.grid(row=0, column=5, sticky="e", padx=6)
-        Tooltip(self._hq, "Lights up once the full-resolution render is displayed.")
+
+        self._zoom_slider = ctk.CTkSlider(
+            zoom_box,
+            from_=ZOOM_LOG_MIN,
+            to=ZOOM_LOG_MAX,
+            width=104,
+            height=16,
+            command=self._on_zoom_slider,
+        )
+        self._zoom_slider.set(0.0)
+        self._zoom_slider.grid(row=0, column=1)
+        Tooltip(
+            self._zoom_slider,
+            f"Zoom the canvas, {2 ** ZOOM_LOG_MIN:.0%} to {2 ** ZOOM_LOG_MAX:.0%}. "
+            "The track is per doubling, so the middle of it is 1:1 rather than "
+            "somewhere in the first tenth.\n\n"
+            "The wheel over the image does the same thing and zooms about the "
+            "cursor.",
+        )
+
+        self._hq = ctk.CTkLabel(
+            zoom_box, text="", font=FONT_MONO, width=52, anchor="e",
+            text_color="#5fbf5f",
+        )
+        self._hq.grid(row=0, column=2, padx=(6, 6))
+        Tooltip(
+            self._hq,
+            "Canvas zoom. 100% is one screen pixel per render pixel.\n\n"
+            "Green once you are looking at the full-resolution render; gray "
+            "while the faster proxy stands in as you edit.",
+        )
+
+        # Six controls do not fit across a narrow window. Rather than let the
+        # right-hand ones fall off the edge, the file actions drop to their own
+        # row when the bar gets tight.
+        bar.bind("<Configure>", self._reflow_toolbar)
 
         self.canvas = ImageCanvas(
-            panel, on_pick=self._on_canvas_pick, on_region=self._on_region_drawn
+            panel,
+            on_pick=self._on_canvas_pick,
+            on_region=self._on_region_drawn,
+            on_view=self._on_canvas_view,
         )
         self.canvas.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
 
         self._status = ctk.CTkLabel(panel, text="", font=FONT_SMALL, anchor="w")
         self._status.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
 
+    def _reflow_toolbar(self, event) -> None:
+        """One row when it fits, two when it does not.
+
+        The small gap between the two thresholds is only there to keep a
+        boundary pixel from flapping: wrapping changes the bar's height, not
+        its width, so the decision does not feed back into its own input.
+        """
+        need = 24 + sum(
+            w.winfo_reqwidth()
+            for w in (
+                self._view, self._fit_btn, self._history_group,
+                self._file_actions, self._zoom_box,
+            )
+        )
+        wrapped = int(self._file_actions.grid_info().get("row", 0)) == 1
+        if not wrapped and event.width < need:
+            self._file_actions.grid(
+                row=1, column=0, columnspan=5, sticky="w", padx=0, pady=(5, 0)
+            )
+        elif wrapped and event.width > need + 16:
+            self._file_actions.grid(
+                row=0, column=3, columnspan=1, sticky="w", padx=(12, 0), pady=0
+            )
+
     # ----------------------------------------------------------------- right
 
     def _build_right(self) -> None:
+        """The rules, and what each one replaces its color with.
+
+        Nothing here narrows a selection: that is the left panel's job. This
+        side is the stack of rules plus the replacement -- wheel, palette
+        colors, and how hard the new color is applied.
+        """
         panel = ctk.CTkFrame(self, width=352)
         panel.grid(row=0, column=2, sticky="nse", padx=(4, 8), pady=8)
         panel.grid_propagate(False)
         panel.grid_columnconfigure(0, weight=1)
-        # The rules list keeps a modest fixed height; the color editor and the
-        # selection settings share one scroll region below it, so every control
-        # stays reachable even at the minimum window size.
+        # The rules list keeps a modest fixed height; the replacement controls
+        # take the slack in one scroll region below it, so every control stays
+        # reachable even at the minimum window size.
         panel.grid_rowconfigure(2, weight=0)
         panel.grid_rowconfigure(3, weight=1)
 
@@ -307,13 +408,13 @@ class RecolorTab(ctk.CTkFrame):
             hover_color="#7a4a4a", command=self._clear_rules,
         ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
-        self._rule_list = ctk.CTkScrollableFrame(panel, height=130)
+        self._rule_list = ctk.CTkScrollableFrame(panel, height=175)
         self._rule_list.grid(row=2, column=0, sticky="nsew", padx=10, pady=6)
         self._rule_list.grid_columnconfigure(0, weight=1)
 
         self._empty_hint = ctk.CTkLabel(
             self._rule_list,
-            text="Click a palette swatch, or arm the\neyedropper and click the image.",
+            text="Click a palette swatch on the left,\nor arm the eyedropper and click\nthe image.",
             font=FONT_SMALL,
             text_color="#999",
             justify="left",
@@ -321,7 +422,7 @@ class RecolorTab(ctk.CTkFrame):
         self._empty_hint.grid(row=0, column=0, sticky="w", padx=6, pady=6)
 
         scroll = ctk.CTkScrollableFrame(panel, label_text="Replace with")
-        scroll.grid(row=3, column=0, sticky="nsew", padx=10, pady=(8, 0))
+        scroll.grid(row=3, column=0, sticky="nsew", padx=10, pady=(8, 10))
         scroll.grid_columnconfigure(0, weight=1)
 
         self._editor = ColorEditor(
@@ -330,36 +431,139 @@ class RecolorTab(ctk.CTkFrame):
         )
         self._editor.grid(row=0, column=0, sticky="ew")
 
-        self._build_rule_settings(scroll)
+        self._build_target_palette(scroll)
+        self._build_blend_controls(scroll)
 
-        actions = ctk.CTkFrame(panel, fg_color="transparent")
-        actions.grid(row=4, column=0, sticky="ew", padx=10, pady=(8, 10))
-        actions.grid_columnconfigure((0, 1), weight=1)
 
-        ctk.CTkButton(actions, text="Export", height=32, command=self._export).grid(
-            row=0, column=0, sticky="ew", padx=(0, 3)
-        )
-        ctk.CTkButton(
-            actions, text="Export As...", height=32, command=self._export_as
-        ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
-        ctk.CTkButton(
-            actions, text="Save preset", height=26, command=self._save_preset
-        ).grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=(4, 0))
-        ctk.CTkButton(
-            actions, text="Load preset", height=26, command=self._load_preset
-        ).grid(row=1, column=1, sticky="ew", padx=(3, 0), pady=(4, 0))
+    def _build_target_palette(self, parent) -> None:
+        """The render's own palette again, but as replacement colors.
 
-    def _build_rule_settings(self, parent) -> None:
-        section_label(parent, "Selection & blending").grid(
+        Mirrors the extracted-palette grid on the left: over there a click says
+        "change this color", here it says "change it to this one" -- which is
+        what you want for swapping two materials, or matching a color the
+        render already uses instead of eyeballing it on the wheel.
+        """
+        section_label(parent, "Palette colors").grid(
             row=1, column=0, sticky="ew", pady=(10, 2)
         )
 
+        self._target_k = LabeledSlider(
+            parent,
+            "Colors (k)",
+            from_=4,
+            to=24,
+            value=KMEANS_DEFAULT_K,
+            steps=20,
+            fmt="{:.0f}",
+            command=self._on_target_k_change,
+        )
+        self._target_k.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+        Tooltip(
+            self._target_k,
+            "How finely to split the render for *this* strip only -- the left "
+            "grid keeps its own k.\n\n"
+            "Raise it to pull out a shade the coarse selection palette merged "
+            "away; lower it for the handful of colors the render is really "
+            "built from.",
+        )
+
+        self._target_swatches = SwatchStrip(
+            parent,
+            on_select=self._on_target_swatch_click,
+            columns=6,
+            chip_size=30,
+            tooltip_suffix="Click to use as the replacement color.",
+            fg_color="transparent",
+        )
+        self._target_swatches.grid(row=3, column=0, sticky="ew", pady=(0, 4))
+        self._target_swatches.show_message("Load a render to see its colors.")
+
+    def _on_target_swatch_click(self, swatch: Swatch) -> None:
+        if self.selected is None:
+            self._status.configure(
+                text="No rule selected. Pick a color to replace first, then "
+                "choose its replacement here."
+            )
+            return
+        # Routed through the editor rather than straight onto the rule, so the
+        # wheel, hex and RGB fields all show the color that is now in effect.
+        self._editor.set_color(hex_to_rgb(swatch.hex), "picker")
+
+    def _sync_target_swatch_highlight(self) -> None:
+        rule = self.selected
+        self._target_swatches.set_active_hex(
+            lab_to_hex(rule.target_lab) if rule is not None else None
+        )
+
+    def _build_selection_controls(self, parent) -> ctk.CTkFrame:
+        """What the selected rule matches: the canvas tools and the matching
+        settings, in the order you reach for them."""
         box = ctk.CTkFrame(parent, fg_color="transparent")
-        box.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         box.grid_columnconfigure(0, weight=1)
 
+        self._eyedropper_btn = ctk.CTkButton(
+            box, text="Eyedropper", height=28, command=self._toggle_eyedropper
+        )
+        self._eyedropper_btn.grid(row=0, column=0, sticky="ew", pady=(2, 9))
+        Tooltip(
+            self._eyedropper_btn,
+            "Click the image to set the selected rule's source color.\n"
+            "Shift+click samples one exact pixel instead of a 3x3 median.\n"
+            "Ctrl+click sets the TARGET color from the image.",
+        )
+
+        region_bar = ctk.CTkFrame(box, fg_color="transparent")
+        region_bar.grid(row=1, column=0, sticky="ew")
+        region_bar.grid_columnconfigure((0, 1, 2), weight=1, uniform="region")
+
+        self._region_btns: dict[str, ctk.CTkButton] = {}
+        for col, (mode, text, tip) in enumerate(
+            (
+                (
+                    "rect",
+                    "▭ Box",
+                    "Drag a box on the image to claim an area for one rule.\n\n"
+                    "The rule is confined to it, and it owns it: no rule below "
+                    "it in the list can paint inside, so a broad rule cannot "
+                    "creep back over a part you separated out.",
+                ),
+                (
+                    "lasso",
+                    "◌ Lasso",
+                    "Draw a freehand outline around a part. Released strokes "
+                    "close automatically.\n\n"
+                    "Same ownership as Box: rules below cannot paint inside it.",
+                ),
+            )
+        ):
+            btn = ctk.CTkButton(
+                region_bar, text=text, height=28,
+                command=lambda m=mode: self._toggle_draw_mode(m),
+            )
+            btn.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 3, 0))
+            Tooltip(btn, tip)
+            self._region_btns[mode] = btn
+
+        self._clear_region_btn = ctk.CTkButton(
+            region_bar, text="Clear", height=28,
+            command=self._clear_region, state="disabled",
+        )
+        self._clear_region_btn.grid(row=0, column=2, sticky="ew", padx=(3, 0))
+        Tooltip(self._clear_region_btn, "Remove the drawn region from this rule.")
+
+        self._apply_region_btn = ctk.CTkButton(
+            box, text="Apply region to this rule", height=28, state="disabled",
+            command=self._apply_region_to_rule,
+        )
+        self._apply_region_btn.grid(row=2, column=0, sticky="ew", pady=(9, 6))
+        Tooltip(
+            self._apply_region_btn,
+            "Confine the selected rule to the region you just drew, instead of "
+            "making a new rule for it.",
+        )
+
         mode_row = ctk.CTkFrame(box, fg_color="transparent")
-        mode_row.grid(row=0, column=0, sticky="ew", pady=(2, 6))
+        mode_row.grid(row=3, column=0, sticky="ew", pady=(2, 6))
         mode_row.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(mode_row, text="Match", font=FONT_SMALL, width=54, anchor="w").grid(
             row=0, column=0, sticky="w"
@@ -384,53 +588,19 @@ class RecolorTab(ctk.CTkFrame):
             box, "Tolerance", from_=1, to=60, value=12, fmt="{:.0f}",
             command=lambda _v: self._sync_rule_from_ui(),
         )
-        self._tolerance.grid(row=1, column=0, sticky="ew", pady=3)
+        self._tolerance.grid(row=4, column=0, sticky="ew", pady=3)
 
         self._feather = LabeledSlider(
             box, "Edge softness", from_=0.0, to=1.0, value=0.35,
             command=lambda _v: self._sync_rule_from_ui(),
         )
-        self._feather.grid(row=2, column=0, sticky="ew", pady=3)
-
-        self._lightness = LabeledSlider(
-            box, "Lightness shift", from_=0.0, to=1.0, value=1.0,
-            command=lambda _v: self._sync_rule_from_ui(),
-        )
-        self._lightness.grid(row=3, column=0, sticky="ew", pady=3)
-        Tooltip(
-            self._lightness,
-            "0 keeps every pixel's original brightness and shifts only hue and "
-            "saturation - best for subtle palette swaps.",
-        )
-
-        self._chroma = LabeledSlider(
-            box, "Saturation shift", from_=0.0, to=1.0, value=1.0,
-            command=lambda _v: self._sync_rule_from_ui(),
-        )
-        self._chroma.grid(row=4, column=0, sticky="ew", pady=3)
-
-        self._opacity = LabeledSlider(
-            box, "Strength", from_=0.0, to=1.0, value=1.0,
-            command=lambda _v: self._sync_rule_from_ui(),
-        )
-        self._opacity.grid(row=5, column=0, sticky="ew", pady=3)
-
-        self._apply_region_btn = ctk.CTkButton(
-            box, text="Apply region to this rule", height=28, state="disabled",
-            command=self._apply_region_to_rule,
-        )
-        self._apply_region_btn.grid(row=6, column=0, sticky="ew", pady=(8, 4))
-        Tooltip(
-            self._apply_region_btn,
-            "Confine the rule selected above to the region you just drew, "
-            "instead of making a new rule for it.",
-        )
+        self._feather.grid(row=5, column=0, sticky="ew", pady=(3, 6))
 
         self._match_all = ctk.CTkCheckBox(
             box, text="Match all pixels", font=FONT_SMALL,
             command=self._sync_rule_from_ui,
         )
-        self._match_all.grid(row=7, column=0, sticky="w", pady=(4, 2))
+        self._match_all.grid(row=6, column=0, sticky="w", pady=2)
         Tooltip(
             self._match_all,
             "Ignore the drawn region and recolor every matching pixel in the "
@@ -443,7 +613,7 @@ class RecolorTab(ctk.CTkFrame):
             box, text="This region only", font=FONT_SMALL,
             command=self._sync_rule_from_ui,
         )
-        self._contiguous.grid(row=8, column=0, sticky="w", pady=2)
+        self._contiguous.grid(row=7, column=0, sticky="w", pady=2)
         Tooltip(
             self._contiguous,
             "Restrict the rule to one connected blob -- the one you clicked, or "
@@ -456,19 +626,59 @@ class RecolorTab(ctk.CTkFrame):
         self._smooth = ctk.CTkCheckBox(
             box, text="Smooth edges", font=FONT_SMALL, command=self._sync_rule_from_ui
         )
-        self._smooth.grid(row=9, column=0, sticky="w", pady=2)
+        self._smooth.grid(row=8, column=0, sticky="w", pady=2)
 
         self._lock_cluster = ctk.CTkCheckBox(
             box, text="Lock to palette swatch", font=FONT_SMALL,
             command=self._sync_rule_from_ui,
         )
-        self._lock_cluster.grid(row=10, column=0, sticky="w", pady=2)
+        self._lock_cluster.grid(row=9, column=0, sticky="w", pady=2)
+
+        return box
+
+    def _build_blend_controls(self, parent) -> None:
+        """How hard the replacement color lands.
+
+        These are not selection: the pixels are already chosen by the time they
+        apply, and each one only scales how far toward the target they move --
+        which is why they sit under the color that is being applied.
+        """
+        section_label(parent, "Apply strength").grid(
+            row=4, column=0, sticky="ew", pady=(10, 2)
+        )
+
+        box = ctk.CTkFrame(parent, fg_color="transparent")
+        box.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        box.grid_columnconfigure(0, weight=1)
+
+        self._lightness = LabeledSlider(
+            box, "Lightness shift", from_=0.0, to=1.0, value=1.0,
+            command=lambda _v: self._sync_rule_from_ui(),
+        )
+        self._lightness.grid(row=0, column=0, sticky="ew", pady=3)
+        Tooltip(
+            self._lightness,
+            "0 keeps every pixel's original brightness and shifts only hue and "
+            "saturation - best for subtle palette swaps.",
+        )
+
+        self._chroma = LabeledSlider(
+            box, "Saturation shift", from_=0.0, to=1.0, value=1.0,
+            command=lambda _v: self._sync_rule_from_ui(),
+        )
+        self._chroma.grid(row=1, column=0, sticky="ew", pady=3)
+
+        self._opacity = LabeledSlider(
+            box, "Strength", from_=0.0, to=1.0, value=1.0,
+            command=lambda _v: self._sync_rule_from_ui(),
+        )
+        self._opacity.grid(row=2, column=0, sticky="ew", pady=3)
 
         self._gamut = ctk.CTkCheckBox(
             box, text="Gamut safe", font=FONT_SMALL, command=self._request_preview
         )
         self._gamut.select()
-        self._gamut.grid(row=11, column=0, sticky="w", pady=2)
+        self._gamut.grid(row=3, column=0, sticky="w", pady=(6, 2))
         Tooltip(
             self._gamut,
             "Pull impossible colors back into sRGB by reducing saturation "
@@ -557,17 +767,55 @@ class RecolorTab(ctk.CTkFrame):
     def _on_k_change(self, _value: float) -> None:
         self._extract_palette()
 
+    def _on_target_k_change(self, _value: float) -> None:
+        self._extract_target_palette()
+
     def _extract_palette(self) -> None:
+        """The selection palette: what the left grid offers, and what rules
+        built from a swatch are bound to."""
         if self.ctx is None:
             return
+        self._palette_params = (
+            int(round(self._k_slider.get())),
+            bool(self._group_neutrals.get()),
+        )
         result = extract_palette(
             self.ctx.proxy,
-            k=int(round(self._k_slider.get())),
+            k=self._palette_params[0],
             seed=seed_for_path(self.ctx.path),
-            group_neutrals=bool(self._group_neutrals.get()),
+            group_neutrals=self._palette_params[1],
         )
         self.ctx.clusters = result
         self._swatches.set_result(result)
+        self._extract_target_palette()
+
+    def _extract_target_palette(self) -> None:
+        """The replacement strip, clustered at its own k.
+
+        How many colors you want to *choose from* is a different question to
+        how many you want to split the render into for selecting: a coarse
+        selection palette next to a fine one to pick a shade out of is a normal
+        way to work. Only the left result is stored on the context -- rules
+        reference cluster ids from that one, and a second set of ids would
+        silently mean something else.
+        """
+        if self.ctx is None:
+            return
+        params = (
+            int(round(self._target_k.get())),
+            bool(self._group_neutrals.get()),
+        )
+        if params == self._palette_params and self.ctx.clusters is not None:
+            result = self.ctx.clusters  # same question, so do not re-run k-means
+        else:
+            result = extract_palette(
+                self.ctx.proxy,
+                k=params[0],
+                seed=seed_for_path(self.ctx.path),
+                group_neutrals=params[1],
+            )
+        self._target_swatches.set_result(result)
+        self._sync_target_swatch_highlight()
 
     def _on_swatch_click(self, swatch: Swatch) -> None:
         # Target starts equal to source, so picking what to change does not
@@ -769,6 +1017,8 @@ class RecolorTab(ctk.CTkFrame):
             self._rebuild_rule_list()
             if self.selected is not None:
                 self._sync_ui_from_rule()
+            else:
+                self._sync_target_swatch_highlight()
         finally:
             self._restoring = False
 
@@ -940,6 +1190,7 @@ class RecolorTab(ctk.CTkFrame):
         self.selected = None
         self._weight_cache.clear()
         self._rebuild_rule_list()
+        self._sync_target_swatch_highlight()
         self._refresh_region_controls()
         self._request_preview()
 
@@ -1006,6 +1257,7 @@ class RecolorTab(ctk.CTkFrame):
         if self.selected is not None:
             self._sync_ui_from_rule()
         else:
+            self._sync_target_swatch_highlight()
             self._refresh_region_controls()
         self._request_preview()
 
@@ -1035,6 +1287,7 @@ class RecolorTab(ctk.CTkFrame):
         finally:
             self._suspend_rule_sync = False
 
+        self._sync_target_swatch_highlight()
         self._refresh_region_controls()
 
     def _sync_rule_from_ui(self) -> None:
@@ -1063,6 +1316,7 @@ class RecolorTab(ctk.CTkFrame):
             "pick color", coalesce_key=("target", id(self.selected))
         )
         self.selected.target_lab = rgb8_to_lab(rgb)
+        self._sync_target_swatch_highlight()
         if not self.selected.is_identity():
             self._leave_selection_view()
         self._refresh_rows()
@@ -1143,7 +1397,6 @@ class RecolorTab(ctk.CTkFrame):
             return
         self._preview_dirty = True
         self._showing_hq = False
-        self._hq.configure(text="")
         if self._settle_after is not None:
             try:
                 self.after_cancel(self._settle_after)
@@ -1211,9 +1464,55 @@ class RecolorTab(ctk.CTkFrame):
             return
         frame = self._current_frame(use_proxy=False)
         if frame is not None:
-            self.canvas.set_frame(frame)
+            # Set before drawing: the canvas reports back synchronously, and the
+            # badge's color is read from this flag.
             self._showing_hq = True
-            self._hq.configure(text="● full res")
+            self.canvas.set_frame(frame)
+
+    def _on_zoom_slider(self, value: float) -> None:
+        """Slider position -> canvas zoom.
+
+        The slider speaks magnification against the render, so mid-edit it has
+        to be converted through whatever frame the canvas is holding: 100% on a
+        half-size proxy is a canvas zoom of 2.
+        """
+        if self._suspend_zoom_sync or self.ctx is None:
+            return
+        frame_w = self.canvas.frame_width
+        if not frame_w:
+            return
+        magnification = 2.0 ** value
+        self.canvas.zoom_to(magnification * self.ctx.shape_full[1] / frame_w)
+
+    def _on_canvas_view(self, width: int, _height: int, zoom: float) -> None:
+        """Report the zoom, measured against the render's own resolution.
+
+        Not the canvas's own zoom factor: that one is relative to whatever
+        frame it currently holds, and the proxy that stands in mid-edit is half
+        size, so it would read 200% at the moment nothing on screen changed
+        size. Displayed width over the render's true width is the honest
+        magnification, and it holds still across the proxy swap.
+
+        The color answers the other half: green once the pixels come from the
+        full-resolution render, gray while the proxy is standing in.
+        """
+        if self.ctx is not None:
+            zoom = width / max(self.ctx.shape_full[1], 1)
+        self._hq.configure(
+            text=f"{zoom * 100:.0f}%",
+            text_color="#5fbf5f" if self._showing_hq else "#8a8a8a",
+        )
+
+        # Follow the wheel, Fit and window resizes. Guarded because moving the
+        # slider lands back here, and writing to it again mid-drag would fight
+        # the pointer.
+        self._suspend_zoom_sync = True
+        try:
+            self._zoom_slider.set(
+                float(np.clip(np.log2(max(zoom, 1e-6)), ZOOM_LOG_MIN, ZOOM_LOG_MAX))
+            )
+        finally:
+            self._suspend_zoom_sync = False
 
     # -------------------------------------------------------------- export
 
