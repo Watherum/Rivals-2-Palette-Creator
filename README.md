@@ -13,13 +13,26 @@ run_debug.bat                 launch with a console, if something goes wrong
 
 ## The Recolor tab
 
+The window opens maximized and is split by question:
+
+| Panel | Answers |
+|---|---|
+| **Left** | *What gets recolored* — source render, extracted palette, Eyedropper, Box/Lasso regions, Match mode, Tolerance, Edge softness |
+| **Right** | *What it becomes* — the rules stack, the color wheel, palette colors, apply strength |
+| **Toolbar** | View, Fit, undo/redo, Export / presets, and the zoom slider |
+
 1. Pick a **character → skin → palette**. The dropdowns are built by scanning
    `Resources/Character_Renders_Source`.
 2. Pick the color to replace, either way:
    - click a chip in **Extracted palette** (k-means over the render), or
    - press **Eyedropper** and click the image.
-3. Set the replacement with the **wheel**, the **hex** field, the **R/G/B**
-   fields, or the **system picker**. All four stay in sync.
+3. Set the replacement with the **wheel** — **Brightness** underneath it is the
+   wheel's third axis, since the disc itself only shows hue and saturation — or
+   the **hex** field, the **R/G/B** fields, the **system picker**, or a chip in
+   **Palette colors**. They all stay in sync. That chip strip has its own
+   **Colors (k)**, independent of the left grid's: how many colors you want to
+   pick *from* is a different question to how finely you want to split the
+   render for *selecting*.
 4. Tune **Tolerance** and the **Match** mode until the selection covers what you
    want. Switch the view to **Selection** to see exactly what a rule has grabbed.
 5. Add as many rules as you need. Add rule 2 by clicking another swatch.
@@ -33,7 +46,8 @@ run_debug.bat                 launch with a console, if something goes wrong
 | Set a rule's source color | Eyedropper + left click (3×3 median) |
 | Sample one exact pixel | Eyedropper + **Shift** + click |
 | Set a rule's *target* from the image | Eyedropper + **Ctrl** + click |
-| Zoom | Mouse wheel (zooms at the cursor) |
+| Zoom | Mouse wheel (about the cursor), or the toolbar **Zoom** slider (about the centre) |
+| Fit the whole sprite | **Fit** |
 | Pan | Right-click drag |
 | **Undo** | **Ctrl+Z** (or the ↶ button) |
 | **Redo** | **Ctrl+R** / **Ctrl+Y** (or the ↷ button) |
@@ -63,6 +77,9 @@ red→blue and blue→green cannot double-apply.
   what keeps antialiased edges clean.
 - **This region only** restricts a rule to the connected region you clicked —
   the way to separate two parts that happen to share a color.
+- **Strength** is how far toward the target color a pixel moves, not layer
+  opacity. Turning a rule down reveals the *original art*, never the rule below
+  it — see the ownership rule above.
 
 ## The Downloads tab
 
@@ -146,11 +163,19 @@ Measured on a 1024×1024 render, ~289k opaque pixels:
 | k-means, k=12 | ~50 ms |
 | Preview render (512px proxy, 3 rules) | **~13 ms** |
 | Full-resolution render | ~64 ms |
+| Canvas redraw, any zoom from 6% to 1600% | ~15 ms |
 
 Interaction runs against the proxy; 250 ms after you stop moving a slider the
-full-resolution pass swaps in and the **● full res** indicator lights. Slider
+full-resolution pass swaps in and the toolbar's zoom badge turns green. Slider
 callbacks only set a dirty flag, and a single 16 ms pump renders at most once
 per tick, so a fast drag cannot queue up hundreds of renders.
+
+The canvas scales **only the part of the image inside the viewport**. Scaling
+the whole frame costs with the square of the zoom — 2.5 s and ~800 MB for one
+redraw at 16× on a 1024px render — while the visible area never exceeds the
+canvas, which is what keeps the last row above flat. Swapping the proxy for the
+full-resolution frame rescales the zoom rather than refitting, so an edit never
+throws away where you were looking.
 
 ## Layout
 
