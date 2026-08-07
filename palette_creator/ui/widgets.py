@@ -51,6 +51,19 @@ class LabeledSlider(ctk.CTkFrame):
         self._slider.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 0))
         self._slider.set(value)
 
+        self._text_color = self._caption.cget("text_color")
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Gray out the whole control, caption and readout included.
+
+        Disabling only the slider leaves a fully lit label above a dead track,
+        which reads as a broken widget rather than an inapplicable one.
+        """
+        self._slider.configure(state="normal" if enabled else "disabled")
+        color = self._text_color if enabled else "#6a6a6a"
+        self._caption.configure(text_color=color)
+        self._value.configure(text_color=color)
+
     def _on_change(self, value: float) -> None:
         self._value.configure(text=self._fmt.format(value))
         if self._command is not None:

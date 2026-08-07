@@ -70,6 +70,10 @@ class RecolorTab(ctk.CTkFrame):
         self._pending_region: Region | None = None
         """A drawn shape not yet attached to any rule. Held rather than applied
         so drawing never mutates whichever rule happens to be selected."""
+        self._draw_onto_selected = False
+        """Whether a finished Box or Lasso confines the selected rule instead
+        of sourcing a new one. Off by default, so the two-step above still
+        holds unless the user has explicitly asked for the other behaviour."""
 
         self._undo_stack: list[tuple[str, list, int]] = []
         self._redo_stack: list[tuple[str, list, int]] = []
@@ -530,7 +534,7 @@ class RecolorTab(ctk.CTkFrame):
 
         region_bar = ctk.CTkFrame(box, fg_color="transparent")
         region_bar.grid(row=1, column=0, sticky="ew")
-        region_bar.grid_columnconfigure((0, 1, 2), weight=1, uniform="region")
+        region_bar.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="region")
 
         self._region_btns: dict[str, ctk.CTkButton] = {}
         for col, (mode, text, tip) in enumerate(
@@ -543,14 +547,38 @@ class RecolorTab(ctk.CTkFrame):
                     "material inside the box.\n\n"
                     "The rule is confined to it, and it owns it: no rule below "
                     "it in the list can paint inside, so a broad rule cannot "
-                    "creep back over a part you separated out.",
+                    "creep back over a part you separated out.\n\n"
+                    "To confine a rule you have already built rather than "
+                    "making a new one, turn on 'Draw onto selected rule' "
+                    "below first.",
                 ),
                 (
                     "lasso",
                     "◌ Lasso",
                     "Draw a freehand outline around a part. Released strokes "
                     "close automatically and make their rule right away.\n\n"
-                    "Same ownership as Box: rules below cannot paint inside it.",
+                    "Same ownership as Box: rules below cannot paint inside it, "
+                    "and 'Draw onto selected rule' below sends it to a rule you "
+                    "already have instead of making one.",
+                ),
+                (
+                    # The mode id doubles as the Region kind the canvas reports
+                    # back, so it is "stroke" rather than "pen".
+                    "stroke",
+                    "✎ Pen",
+                    "Paint pixels by hand. Every pixel the stroke covers takes "
+                    "the color flat, whatever it was before -- there is no "
+                    "color match to tune, so Match, Tolerance and Edge "
+                    "softness go gray while a stroke is selected.\n\n"
+                    "For a stroke that follows the shading underneath instead, "
+                    "turn Lightness shift down (keeps the original brightness) "
+                    "or Strength down (blends back toward the original).\n\n"
+                    "Each unbroken stroke becomes its own rule, so you can "
+                    "recolor it later by selecting it and picking a new color. "
+                    "The pen stays armed after a stroke; press ✎ Pen again to "
+                    "put it down.\n\n"
+                    "New strokes go to the TOP of the rules list, so a stroke "
+                    "always lands on top of the color rules you already had.",
                 ),
             )
         ):
@@ -566,25 +594,53 @@ class RecolorTab(ctk.CTkFrame):
             region_bar, text="Clear", height=28,
             command=self._clear_region, state="disabled",
         )
-        self._clear_region_btn.grid(row=0, column=2, sticky="ew", padx=(3, 0))
-        Tooltip(self._clear_region_btn, "Remove the drawn region from this rule.")
-
-        self._apply_region_btn = ctk.CTkButton(
-            box, text="Apply region to this rule", height=28, state="disabled",
-            command=self._apply_region_to_rule,
-        )
-        self._apply_region_btn.grid(row=2, column=0, sticky="ew", pady=(9, 6))
+        self._clear_region_btn.grid(row=0, column=3, sticky="ew", padx=(3, 0))
         Tooltip(
-            self._apply_region_btn,
-            "Confine the selected rule to a shape that is still waiting to be "
-            "claimed.\n\n"
-            "A finished Box or Lasso normally makes its own rule, so this only "
-            "has something to act on when that could not be done -- an empty "
-            "area, or no render loaded.",
+            self._clear_region_btn,
+            "Remove the drawn region from this rule.\n\n"
+            "Not available on a pen rule: the stroke is the whole selection, so "
+            "removing it would leave a rule matching that color everywhere. "
+            "Delete the rule instead.",
+        )
+
+        self._pen_size = LabeledSlider(
+            box, "Pen size", from_=1, to=48, value=8, steps=47, fmt="{:.0f} px",
+            command=self._on_pen_size,
+        )
+        self._pen_size.grid(row=2, column=0, sticky="ew", pady=(7, 2))
+        Tooltip(
+            self._pen_size,
+            "Stroke thickness, in pixels of the full-resolution render -- not "
+            "of the canvas, so it does not change as you zoom.\n\n"
+            "Sets the size of the next stroke only. A stroke already drawn "
+            "keeps the width it was drawn at.",
+        )
+
+        # Took over the slot of "Apply region to this rule", which had no
+        # reachable state left once Box and Lasso started making their own
+        # rules: it lit up only for a shape that failed to become one, and a
+        # shape drawn off the sprite is clamped to the image bounds and then
+        # rejected as too small, so its callback never even fired.
+        self._draw_onto_btn = ctk.CTkButton(
+            box, text="Draw onto selected rule", height=28,
+            command=self._toggle_draw_onto,
+        )
+        self._draw_onto_btn.grid(row=3, column=0, sticky="ew", pady=(9, 6))
+        Tooltip(
+            self._draw_onto_btn,
+            "While this is on, a finished Box or Lasso confines the rule you "
+            "have selected instead of making a new one.\n\n"
+            "This is the way to scope a rule you have already built. Drawing "
+            "normally sources a brand-new rule from whatever is inside the "
+            "shape, which throws away the target color and tolerance you "
+            "tuned on the old one.\n\n"
+            "It stays on until you turn it off. The Pen ignores it -- a stroke "
+            "always makes its own rule, since dropping one onto a color rule "
+            "would replace that rule's whole selection.",
         )
 
         mode_row = ctk.CTkFrame(box, fg_color="transparent")
-        mode_row.grid(row=3, column=0, sticky="ew", pady=(2, 6))
+        mode_row.grid(row=4, column=0, sticky="ew", pady=(2, 6))
         mode_row.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(mode_row, text="Match", font=FONT_SMALL, width=54, anchor="w").grid(
             row=0, column=0, sticky="w"
@@ -609,19 +665,19 @@ class RecolorTab(ctk.CTkFrame):
             box, "Tolerance", from_=1, to=60, value=12, fmt="{:.0f}",
             command=lambda _v: self._sync_rule_from_ui(),
         )
-        self._tolerance.grid(row=4, column=0, sticky="ew", pady=3)
+        self._tolerance.grid(row=5, column=0, sticky="ew", pady=3)
 
         self._feather = LabeledSlider(
             box, "Edge softness", from_=0.0, to=1.0, value=0.35,
             command=lambda _v: self._sync_rule_from_ui(),
         )
-        self._feather.grid(row=5, column=0, sticky="ew", pady=(3, 6))
+        self._feather.grid(row=6, column=0, sticky="ew", pady=(3, 6))
 
         self._match_all = ctk.CTkCheckBox(
             box, text="Match all pixels", font=FONT_SMALL,
             command=self._sync_rule_from_ui,
         )
-        self._match_all.grid(row=6, column=0, sticky="w", pady=2)
+        self._match_all.grid(row=7, column=0, sticky="w", pady=2)
         Tooltip(
             self._match_all,
             "Ignore the drawn region and recolor every matching pixel in the "
@@ -633,7 +689,13 @@ class RecolorTab(ctk.CTkFrame):
         self._smooth = ctk.CTkCheckBox(
             box, text="Smooth edges", font=FONT_SMALL, command=self._sync_rule_from_ui
         )
-        self._smooth.grid(row=7, column=0, sticky="w", pady=2)
+        self._smooth.grid(row=8, column=0, sticky="w", pady=2)
+        Tooltip(
+            self._smooth,
+            "Feather the edge of the selection by about a pixel.\n\n"
+            "The one matching control a pen rule still uses: it softens the "
+            "hard edge of the stroke against antialiased art.",
+        )
 
         return box
 
@@ -660,7 +722,9 @@ class RecolorTab(ctk.CTkFrame):
         Tooltip(
             self._lightness,
             "0 keeps every pixel's original brightness and shifts only hue and "
-            "saturation - best for subtle palette swaps.",
+            "saturation - best for subtle palette swaps.\n\n"
+            "On a pen stroke this is what turns a flat fill into a tint that "
+            "follows the shading it was drawn over.",
         )
 
         self._chroma = LabeledSlider(
@@ -758,6 +822,9 @@ class RecolorTab(ctk.CTkFrame):
         h, w = self.ctx.shape_full
         self._file_label.configure(text=f"{path.name}\n{w} x {h}")
         self.canvas.set_frame(self.ctx.rgba_full, keep_view=False)
+        # Pen size is quoted in full-render pixels, so the normalized width it
+        # maps to depends on the render that is loaded.
+        self._push_pen_width()
         self._extract_palette()
         self._refresh_region_controls()
         self._request_preview()
@@ -876,13 +943,51 @@ class RecolorTab(ctk.CTkFrame):
         self.canvas.set_draw_mode(mode if active else None)
         if active:
             self._set_eyedropper(False)  # one canvas gesture at a time
+            self._push_pen_width()
         self._refresh_region_controls()
         if active:
             self._status.configure(
-                text=f"Drag on the image to draw a "
-                f"{'box' if mode == 'rect' else 'lasso'} region. "
-                "Releasing it makes a rule for that area."
+                text={
+                    "rect": "Drag on the image to draw a box region. "
+                            "Releasing it makes a rule for that area.",
+                    "lasso": "Drag on the image to draw a lasso region. "
+                             "Releasing it makes a rule for that area.",
+                    "stroke": "Draw on the image. Each stroke becomes its own "
+                              "rule at the top of the list; pick a color for "
+                              "it on the right.",
+                }[mode]
             )
+
+    def _toggle_draw_onto(self) -> None:
+        self._draw_onto_selected = not self._draw_onto_selected
+        self._refresh_region_controls()
+        self._status.configure(
+            text=(
+                "Box and Lasso will now confine the selected rule instead of "
+                "making a new one. The Pen still makes its own rule."
+            )
+            if self._draw_onto_selected
+            else "Box and Lasso make their own rule again."
+        )
+
+    def _on_pen_size(self, _value: float) -> None:
+        self._push_pen_width()
+
+    def _pen_width_uv(self) -> float:
+        """Pen size in full-render pixels -> a fraction of the image width.
+
+        Stored normalized so one stroke rasterizes to the same band on the
+        512px proxy and on the full render, exactly like the points do. The
+        slider speaks full-render pixels because that is the resolution the
+        export is written at -- the number means the same thing whatever the
+        canvas happens to be showing.
+        """
+        px = max(round(self._pen_size.get()), 1)
+        width = self.ctx.shape_full[1] if self.ctx is not None else 1024
+        return px / max(width - 1, 1)
+
+    def _push_pen_width(self) -> None:
+        self.canvas.set_pen_width(self._pen_width_uv())
 
     def _on_region_drawn(self, kind: str, points: list) -> None:
         """A finished shape immediately becomes a rule for that area.
@@ -896,8 +1001,19 @@ class RecolorTab(ctk.CTkFrame):
         adds a rule of its own and selects that, which is the thing the old
         two-step guarded against.
         """
-        self._pending_region = Region(kind=kind, points=points)
-        self.canvas.set_draw_mode(None)
+        pen = kind == "stroke"
+        self._pending_region = Region(
+            kind=kind, points=points, width=self._pen_width_uv() if pen else 0.0
+        )
+        if not pen:
+            # The pen stays armed: strokes come in runs, and disarming after
+            # each one would mean re-clicking the tool for every dab.
+            self.canvas.set_draw_mode(None)
+
+        note = self._draw_onto_note(pen)
+        if note is None:
+            self._apply_region_to_rule()
+            return
 
         rule = self._rule_for_region(self._pending_region) if self.ctx else None
         if rule is None:
@@ -907,8 +1023,36 @@ class RecolorTab(ctk.CTkFrame):
             self._refresh_region_controls()
             return
 
-        self._append_rule(rule)  # consumes the pending region onto the new rule
+        # A stroke goes to the top of the stack rather than the bottom. Rules
+        # own their pixels outright, so a stroke appended below the color rules
+        # already in the list would be painted over by them and appear to do
+        # nothing -- and a hand-drawn stroke is the most specific thing the user
+        # can say about a pixel, so it gets the last word.
+        self._append_rule(
+            rule, on_top=pen, label="draw stroke" if pen else "add rule"
+        )  # consumes the pending region onto the new rule
         self._refresh_region_controls()
+        if note:
+            # Appended rather than replacing: _append_rule has just reported the
+            # new rule's coverage, and that is still the more useful half.
+            self._status.configure(text=f"{self._status.cget('text')}{note}")
+
+    def _draw_onto_note(self, pen: bool) -> str | None:
+        """Route a finished shape: ``None`` means give it to the selected rule.
+
+        Anything else is a string to append to the status line explaining why a
+        new rule was made even though "Draw onto selected rule" is on -- silence
+        there would just look like the toggle was broken.
+        """
+        if not self._draw_onto_selected or pen:
+            return ""
+        if self.selected is None:
+            return "  (Nothing was selected, so it made its own rule.)"
+        if self.selected.is_pen:
+            # Handing a box to a pen rule would drop its stroke and turn it back
+            # into a color rule, losing the only thing that rule was.
+            return "  (The selected rule is a pen stroke, so it made its own.)"
+        return None
 
     def _consume_pending_region(self, rule: RecolorRule) -> bool:
         """Move any pending region onto ``rule``. Returns whether one moved."""
@@ -920,6 +1064,13 @@ class RecolorTab(ctk.CTkFrame):
         return True
 
     def _apply_region_to_rule(self) -> None:
+        """Confine the selected rule to the shape just drawn.
+
+        Reached through "Draw onto selected rule". Keeps everything else about
+        the rule -- its source color, target, tolerance and mode -- which is
+        the whole point: drawing normally builds a *new* rule out of whatever
+        is inside the shape and discards all of that.
+        """
         if self.selected is None or self._pending_region is None:
             return
         self._push_undo("apply region to rule")
@@ -952,7 +1103,8 @@ class RecolorTab(ctk.CTkFrame):
         self._report_selection()
 
     def _refresh_region_controls(self) -> None:
-        """Keep the toolbar in step with the canvas mode and the selected rule."""
+        """Keep the selection panel in step with the canvas mode and the
+        selected rule."""
         mode = self.canvas.draw_mode
         theme = ctk.ThemeManager.theme["CTkButton"]
         for name, btn in self._region_btns.items():
@@ -962,13 +1114,22 @@ class RecolorTab(ctk.CTkFrame):
                 hover_color="#3a763a" if on else theme["hover_color"],
             )
 
+        self._refresh_match_controls()
+
         pending = self._pending_region is not None
         own = self.selected is not None and self.selected.region is not None
+        # Clearing a pen rule's stroke would not narrow it, it would widen it to
+        # every pixel of that color in the render. Delete the rule instead.
+        pen_rule = self.selected is not None and self.selected.is_pen
         self._clear_region_btn.configure(
-            state="normal" if (pending or own) else "disabled"
+            state="normal" if (pending or (own and not pen_rule)) else "disabled"
         )
-        self._apply_region_btn.configure(
-            state="normal" if (pending and self.selected is not None) else "disabled"
+        # Lit like the drawing tools above it, because it is the same kind of
+        # state: a mode that changes what the next gesture does.
+        on = self._draw_onto_selected
+        self._draw_onto_btn.configure(
+            fg_color="#2e5f2e" if on else theme["fg_color"],
+            hover_color="#3a763a" if on else theme["hover_color"],
         )
         self._add_rule_btn.configure(
             text="+ Add rule for region" if pending else "+ Add rule"
@@ -979,6 +1140,35 @@ class RecolorTab(ctk.CTkFrame):
             self.canvas.set_region(self._pending_region)
         else:
             self.canvas.set_region(self.selected.region if self.selected else None)
+
+        # Every stroke still waiting for a color, apart from whichever one the
+        # line above is already showing. A colorless stroke draws nothing into
+        # the render, so without a mark it is simply not on screen -- which
+        # made drawing a run of strokes and coloring them afterwards
+        # impossible to keep track of.
+        self.canvas.set_pending_strokes(
+            [
+                rule.region
+                for rule in self.rules
+                if rule.is_pen and rule.is_identity() and rule is not self.selected
+            ]
+        )
+
+    def _refresh_match_controls(self) -> None:
+        """Gray out the color-matching controls when a pen rule is selected.
+
+        A pen rule selects by where the stroke went, not by color, so Match,
+        Tolerance and Edge softness have nothing to act on and Match all pixels
+        has no confinement to lift. Leaving them live would invite the user to
+        drag a slider and watch nothing happen. Smooth edges stays enabled --
+        it still feathers the band.
+        """
+        pen = self.selected is not None and self.selected.is_pen
+        state = "disabled" if pen else "normal"
+        self._mode.configure(state=state)
+        self._match_all.configure(state=state)
+        self._tolerance.set_enabled(not pen)
+        self._feather.set_enabled(not pen)
 
     def _on_swatch_hover(self, swatch: Swatch | None) -> None:
         self._hover_swatch = swatch
@@ -1080,9 +1270,10 @@ class RecolorTab(ctk.CTkFrame):
         # With a region pending, "add rule" means "a rule for that area", so the
         # source color comes from inside it rather than from swatch 0.
         if self._pending_region is not None:
+            pen = self._pending_region.kind == "stroke"
             rule = self._rule_for_region(self._pending_region)
             if rule is not None:
-                self._append_rule(rule)
+                self._append_rule(rule, on_top=pen)
                 return
 
         source = (
@@ -1137,12 +1328,17 @@ class RecolorTab(ctk.CTkFrame):
         y, x = divmod(int(ps.idx[member[int(np.argmin(d))]]), w)
         return (x / max(w - 1, 1), y / max(h - 1, 1))
 
-    def _append_rule(self, rule: RecolorRule) -> None:
-        self._push_undo("add rule")
+    def _append_rule(
+        self, rule: RecolorRule, *, on_top: bool = False, label: str = "add rule"
+    ) -> None:
+        self._push_undo(label)
         # Any new rule created while a shape is pending is scoped to it, so the
         # eyedropper and the palette swatches honour a drawn region too.
         self._consume_pending_region(rule)
-        self.rules.append(rule)
+        if on_top:
+            self.rules.insert(0, rule)
+        else:
+            self.rules.append(rule)
         self.selected = rule
         self._rebuild_rule_list()
         self._sync_ui_from_rule()
@@ -1155,6 +1351,21 @@ class RecolorTab(ctk.CTkFrame):
         self._report_selection()
 
     def _show_selection_view(self) -> None:
+        """Flip to the Selection overlay so a pending rule shows what it grabbed.
+
+        Never for a pen rule. The Selection overlay paints one rule's mask over
+        the *original* art, so switching to it throws away every other rule on
+        screen -- which is the right trade for a color match, invisible until
+        you look at it, and a bad one for a stroke, which is already drawn on
+        the canvas at its exact width. Drawing a run of strokes used to blank
+        the whole preview after every single one.
+
+        Guarded here rather than at the four call sites because every one of
+        them is acting on ``self.selected``, so this cannot drift out of step
+        with them.
+        """
+        if self.selected is not None and self.selected.is_pen:
+            return
         if self._view_mode != "Selection":
             self._auto_selection = True
             self._view_mode = "Selection"
@@ -1178,15 +1389,22 @@ class RecolorTab(ctk.CTkFrame):
 
         if rule.region is None:
             note = ""
+        elif rule.is_pen:
+            note = "  [pen stroke; rules below cannot paint there]"
         elif rule.match_all:
             note = "  [region ignored - 'Match all pixels' is on]"
         else:
             note = f"  [owns its drawn {rule.region.kind}; rules below cannot paint there]"
 
         if rule.is_identity():
+            next_step = (
+                "Pick a replacement color for the stroke."
+                if rule.is_pen
+                else "Adjust Tolerance if needed, then pick a replacement color."
+            )
             self._status.configure(
                 text=f"Selected {covered * 100:.1f}% of the render.{note} "
-                "Adjust Tolerance if needed, then pick a replacement color."
+                f"{next_step}"
             )
         else:
             self._status.configure(

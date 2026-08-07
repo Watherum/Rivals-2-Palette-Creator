@@ -101,21 +101,28 @@ class RuleRow(ctk.CTkFrame):
         self._src.set_color(lab_to_hex(rule.source_lab))
         self._dst.set_color(lab_to_hex(rule.target_lab))
 
+        pen = rule.is_pen
         flags = []
         if rule.contiguous:
             flags.append("region")
         if rule.smooth_edges:
             flags.append("smooth")
-        if rule.lock_to_cluster:
+        if rule.lock_to_cluster and not pen:
             flags.append("locked")
         suffix = f"  [{', '.join(flags)}]" if flags else ""
 
+        # A pen rule's match settings are inert, so showing a tolerance on it
+        # would advertise a knob that does nothing.
+        what = "✎ pen stroke" if pen else f"{rule.mode.value}  tol {rule.tolerance:.0f}"
+
         if rule.is_identity():
             # Selected but no replacement colour chosen yet, so it changes nothing.
-            text = f"pick a color · tol {rule.tolerance:.0f}"
+            # No ✎ here: the row's label column clips, and the glyph costs more
+            # width than it earns next to text that is already this long.
+            text = f"pick a color · {'pen' if pen else f'tol {rule.tolerance:.0f}'}"
             color = "#ffcc66"
         else:
-            text = f"{rule.mode.value}  tol {rule.tolerance:.0f}{suffix}"
+            text = f"{what}{suffix}"
             color = "#e6e6e6" if rule.enabled else "#777777"
 
         self._label.configure(text=text, text_color=color)

@@ -53,6 +53,9 @@ def rule_to_dict(rule: RecolorRule) -> dict:
         data["region"] = {
             "kind": rule.region.kind,
             "points": [list(p) for p in rule.region.points],
+            # Also normalized -- a fraction of the image width -- so a pen
+            # stroke keeps its thickness relative to the art on any render.
+            "width": rule.region.width,
         }
     return data
 
@@ -76,6 +79,7 @@ def rule_from_dict(data: dict) -> RecolorRule:
         rule.region = Region(
             kind=region.get("kind", "rect"),
             points=[tuple(p) for p in region.get("points", [])],
+            width=float(region.get("width", 0.0)),
         )
     return rule
 

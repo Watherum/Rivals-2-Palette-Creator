@@ -17,7 +17,7 @@ The window opens maximized and is split by question:
 
 | Panel | Answers |
 |---|---|
-| **Left** | *What gets recolored* — source render, extracted palette, Eyedropper, Box/Lasso regions, Match mode, Tolerance, Edge softness |
+| **Left** | *What gets recolored* — source render, extracted palette, Eyedropper, Box/Lasso regions, the Pen, Match mode, Tolerance, Edge softness |
 | **Right** | *What it becomes* — the rules stack, the color wheel, palette colors, apply strength |
 | **Toolbar** | View, Fit, undo/redo, Export / presets, and the zoom slider |
 
@@ -46,6 +46,7 @@ The window opens maximized and is split by question:
 | Set a rule's source color | Eyedropper + left click (3×3 median) |
 | Sample one exact pixel | Eyedropper + **Shift** + click |
 | Set a rule's *target* from the image | Eyedropper + **Ctrl** + click |
+| Paint a stroke | **✎ Pen**, then drag on the image (a click is a dab) |
 | Zoom | Mouse wheel (about the cursor), or the toolbar **Zoom** slider (about the centre) |
 | Fit the whole sprite | **Fit** |
 | Pan | Right-click drag |
@@ -76,10 +77,58 @@ red→blue and blue→green cannot double-apply.
 - **Edge softness** widens the ramp between selected and unselected, which is
   what keeps antialiased edges clean.
 - **Box / Lasso** confine a rule to an area you draw — the way to separate two
-  parts that happen to share a color. Finishing the shape creates the rule.
+  parts that happen to share a color. Finishing the shape creates the rule,
+  sourced from the dominant material inside it.
+- **Draw onto selected rule** changes that: while it is on, a finished Box or
+  Lasso confines the rule you have *already* selected instead of making a new
+  one, keeping its source, target, tolerance and mode. This is how you scope a
+  rule you have tuned — drawing normally rebuilds a rule from whatever is inside
+  the shape and throws all of that away. It stays on until you turn it off, and
+  it lights up green like the drawing tools. With nothing selected, or with a
+  pen rule selected, the shape falls back to making its own rule and the status
+  line says why. The **Pen** always makes its own rule: dropping a stroke onto a
+  color rule would replace that rule's entire selection.
 - **Strength** is how far toward the target color a pixel moves, not layer
   opacity. Turning a rule down reveals the *original art*, never the rule below
   it — see the ownership rule above.
+
+### The Pen
+
+**✎ Pen** paints pixels by hand, for the details no color rule can reach: a
+stripe, a marking, a stray pixel the k-means split the wrong way. **Pen size**
+sets the stroke thickness in pixels of the *full-resolution* render, so the
+number means the same thing at any zoom and in the export.
+
+- **Each unbroken stroke becomes its own rule.** Draw, then pick a color for it
+  on the right — and pick a different one later by selecting that rule again. A
+  single click is a valid dab.
+- The pen stays armed after a stroke, so strokes come in runs. Press **✎ Pen**
+  again to put it down.
+- Finishing a stroke does **not** flip the canvas to the Selection view the way
+  a palette or eyedropper rule does. That view shows one rule's mask over the
+  original art, so it would blank every stroke you already had after every
+  single one — and a stroke is already drawn on the canvas, so it would be
+  telling you nothing you could not see. A stroke with no color yet is marked
+  with a magenta band; the selected one carries a dashed centerline.
+- **Every pixel the stroke covers takes the color flat**, whatever it was
+  before. There is no color match involved, so **Match**, **Tolerance** and
+  **Edge softness** gray out while a stroke is selected; **Smooth edges** stays
+  live, because it feathers the band itself.
+- This is the one place the engine does not preserve a tonal ramp, and it is
+  deliberate. The color rules anchor their levels curve on the rule's *source*
+  color, which is right when the rule was aimed at one material — but a stroke
+  crosses whatever it crosses. Anchored that way, a stroke drawn across an
+  orange leg onto a white wrap left the white all but untouched: red over white
+  came out white. Shading is still available, on the sliders that already say
+  what they do — **Lightness shift 0** keeps each pixel's own brightness and
+  takes only hue and saturation, **Strength** blends back toward the original.
+- **New strokes go to the top of the rules list.** Rules own their pixels
+  outright, so a stroke appended below the color rules already in the list would
+  simply be painted over — 83% of one stroke's pixels, measured on a real
+  render. A hand-drawn stroke is the most specific thing you can say about a
+  pixel, so it gets the last word.
+- Transparent pixels are never painted, however far past the silhouette the
+  stroke goes.
 
 ## The Downloads tab
 
@@ -212,6 +261,9 @@ python -m pytest -m "not network"      # skip the live-wiki tests
 The recolor tests are written as invariants rather than golden images: alpha is
 preserved byte for byte, unselected pixels stay bit-identical, shading spans
 survive retargeting, lightness ordering never inverts, and rules never cascade.
+The pen has its own set: a stroke rasterizes to the same band at proxy and full
+resolution, takes every pixel it covers whatever the color, paints flat, and
+never reaches a transparent pixel.
 
 ## Notes on the asset set
 

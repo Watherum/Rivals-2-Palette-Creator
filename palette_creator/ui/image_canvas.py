@@ -73,9 +73,19 @@ class ImageCanvas(tk.Frame):
         self._eyedropper = False
         self._pan_anchor: tuple[float, float] | None = None
 
-        self._draw_mode: str | None = None  # None | "rect" | "lasso"
+        # None, or a recolor.Region kind: "rect", "lasso" or "stroke". The mode
+        # name IS the kind -- _on_release hands it straight to the callback as
+        # the region's kind, so the two must not drift apart.
+        self._draw_mode: str | None = None
         self._drawing: list[tuple[float, float]] | None = None  # image coords
-        self._region: tuple[str, list] | None = None  # committed, normalized
+        self._region: tuple[str, list, float] | None = None  # committed, normalized
+        self._pen_width = 0.0
+        """Pen thickness for the stroke being drawn, as a fraction of the image
+        width. A committed stroke carries its own instead, so changing the pen
+        size never resizes a stroke already drawn."""
+        self._pending_strokes: list[tuple[list, float]] = []
+        """Strokes drawn but not yet given a color, other than the selected
+        one. Marked faintly so a run of strokes stays findable."""
 
         self.canvas.bind("<Configure>", self._on_resize)
         self.canvas.bind("<Button-1>", self._on_button1)
@@ -143,7 +153,10 @@ class ImageCanvas(tk.Frame):
     # -- region drawing -----------------------------------------------------
 
     def set_draw_mode(self, mode: str | None) -> None:
-        """``None``, ``"rect"`` or ``"lasso"``. Drawing preempts the eyedropper."""
+        """``None``, ``"rect"``, ``"lasso"`` or ``"stroke"``.
+
+        Drawing preempts the eyedropper.
+        """
         self._draw_mode = mode
         self._drawing = None
         self._apply_cursor()
@@ -153,12 +166,32 @@ class ImageCanvas(tk.Frame):
     def draw_mode(self) -> str | None:
         return self._draw_mode
 
+    def set_pen_width(self, width: float) -> None:
+        """Thickness for the *next* stroke, as a fraction of the image width."""
+        self._pen_width = max(float(width), 0.0)
+        if self._draw_mode == "stroke":
+            self._draw_overlay()
+
+    def set_pending_strokes(self, regions) -> None:
+        """Mark strokes that have been drawn but have no color yet.
+
+        Anything not on this list and not the selected region is left alone: a
+        stroke that has been colored is visible in the render already, and a
+        marker over it would only hide the thing you drew it for.
+        """
+        self._pending_strokes = [
+            (list(r.points), r.width)
+            for r in regions
+            if r is not None and r.kind == "stroke" and r.is_valid()
+        ]
+        self._draw_overlay()
+
     def set_region(self, region) -> None:
         """Show ``region`` (a recolor.Region) as the committed outline."""
         if region is None or not region.is_valid():
             self._region = None
         else:
-            self._region = (region.kind, list(region.points))
+            self._region = (region.kind, list(region.points), region.width)
         self._draw_overlay()
 
     def _apply_cursor(self) -> None:
@@ -184,15 +217,34 @@ class ImageCanvas(tk.Frame):
             return
         ih, iw = self._frame.shape[:2]
 
+        def to_canvas(norm):
+            return [
+                self._image_to_canvas(u * (iw - 1), v * (ih - 1)) for u, v in norm
+            ]
+
+        # Drawn first, so the selected stroke below sits on top of them.
+        for norm, width in self._pending_strokes:
+            self._draw_stroke_overlay(
+                to_canvas(norm), width * max(iw - 1, 1) * self._zoom, style="faint"
+            )
+
         if self._drawing:
-            kind, pts = self._draw_mode, self._drawing
+            kind, pts, width = self._draw_mode, self._drawing, self._pen_width
+            canvas_pts = [self._image_to_canvas(x, y) for x, y in pts]
         elif self._region:
-            kind, norm = self._region
-            pts = [(u * (iw - 1), v * (ih - 1)) for u, v in norm]
+            kind, norm, width = self._region
+            canvas_pts = to_canvas(norm)
         else:
             return
 
-        canvas_pts = [self._image_to_canvas(x, y) for x, y in pts]
+        if kind == "stroke":
+            self._draw_stroke_overlay(
+                canvas_pts,
+                width * max(iw - 1, 1) * self._zoom,
+                style="live" if self._drawing else "marker",
+            )
+            return
+
         if kind == "rect" and len(canvas_pts) == 2:
             (x0, y0), (x1, y1) = canvas_pts
             shape = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
@@ -209,6 +261,54 @@ class ImageCanvas(tk.Frame):
         self.canvas.create_polygon(
             flat, outline="#ffffff", fill="", width=1, dash=(5, 4), tags="region"
         )
+
+    STROKE_COLOR = "#ff00c8"
+
+    def _draw_stroke_overlay(self, pts: list, width: float, *, style: str) -> None:
+        """Show a pen path as the band it will actually paint.
+
+        An outline would be the wrong feedback here: with the pen, the width is
+        the whole point, so the band itself is drawn.
+
+        ``live`` is solid -- the stroke is under the cursor and you are watching
+        where it lands. Everything else is stippled at the same weight, so the
+        recolor underneath stays readable and, more to the point, so an
+        uncolored stroke is *findable*: it paints nothing into the render, so
+        without a mark it is simply not on screen. Which of them is selected is
+        said with a dashed centerline rather than by fading the others out --
+        the same black-under-white outline the Box and Lasso regions use, and
+        a fainter stipple turned out to be unreadable against the checkerboard.
+        """
+        width = max(width, 1.0)
+        kw = {} if style == "live" else {"stipple": "gray50"}
+
+        if len(pts) == 1:
+            (x, y), r = pts[0], width / 2.0
+            box = (x - r, y - r, x + r, y + r)
+            self.canvas.create_oval(
+                *box, outline="", fill=self.STROKE_COLOR, tags="region", **kw
+            )
+            if style == "marker":
+                self.canvas.create_oval(
+                    *box, outline="#ffffff", fill="", width=1, dash=(4, 3),
+                    tags="region",
+                )
+            return
+
+        flat = [c for point in pts for c in point]
+        self.canvas.create_line(
+            flat,
+            fill=self.STROKE_COLOR,
+            width=width,
+            capstyle="round",
+            joinstyle="round",
+            tags="region",
+            **kw,
+        )
+        if style == "marker":
+            self.canvas.create_line(
+                flat, fill="#ffffff", width=1, dash=(5, 4), tags="region"
+            )
 
     @property
     def zoom(self) -> float:
@@ -352,7 +452,9 @@ class ImageCanvas(tk.Frame):
             self._drawing[1] = point
         else:
             # Thin the trail: raw motion events give sub-pixel steps that bloat
-            # the polygon without changing its shape.
+            # the polygon without changing its shape. Safe for the pen too --
+            # consecutive points are joined by a line, so thinning never opens
+            # a gap in the band, it only drops vertices that were on it anyway.
             last = self._drawing[-1]
             if abs(point[0] - last[0]) + abs(point[1] - last[1]) >= 1.5:
                 self._drawing.append(point)
@@ -368,6 +470,7 @@ class ImageCanvas(tk.Frame):
             return
         ih, iw = self._frame.shape[:2]
 
+        # The pen is exempt: a single click is a dab, not a stray gesture.
         too_small = (
             kind == "rect"
             and (
@@ -380,7 +483,7 @@ class ImageCanvas(tk.Frame):
             return
 
         norm = [(x / max(iw - 1, 1), y / max(ih - 1, 1)) for x, y in pts]
-        self._region = (kind, norm)
+        self._region = (kind, norm, self._pen_width if kind == "stroke" else 0.0)
         self._draw_overlay()
         if self.on_region is not None:
             self.on_region(kind, norm)

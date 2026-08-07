@@ -15,7 +15,13 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from palette_creator.colorspace import hex_to_lab, lab_to_hex, rgb8_to_lab
+from palette_creator.colorspace import (
+    hex_to_lab,
+    hex_to_rgb,
+    lab_to_hex,
+    rgb8_to_lab,
+    rgb_to_lab,
+)
 from palette_creator.config import SOURCE_DIR
 from palette_creator.imagectx import load_context
 from palette_creator.palette_extract import extract_palette, seed_for_path
@@ -620,3 +626,250 @@ def test_proxy_matches_full_resolution(ctx):
 @real_assets
 def test_no_rules_returns_original(ctx):
     assert np.array_equal(render(ctx, [], use_proxy=False), ctx.rgba_full)
+
+
+# -- the pen ----------------------------------------------------------------
+
+
+def _stroke_rule(**kw) -> RecolorRule:
+    """A pen stroke diagonally across the 64px gradient.
+
+    Diagonal on purpose. The fixture ramps vertically with blue beside red, so
+    a diagonal is the one path that crosses both hues *and* the whole tonal
+    range -- and the point of a pen is that it takes what it covers rather than
+    what matches, which a stroke confined to one tone could not show.
+    """
+    region = Region("stroke", [(0.15, 0.15), (0.85, 0.85)], width=6 / 63)
+    return RecolorRule(
+        source_lab=rgb8_to_lab((200, 0, 0)),
+        target_lab=hex_to_lab("#00C800"),
+        region=region,
+        **kw,
+    )
+
+
+def test_stroke_width_is_resolution_independent():
+    """One stroke has to come out the same band at proxy and full res.
+
+    The width is stored as a fraction of the image width for the same reason
+    the points are normalized: the preview rasterizes it at 512px and the
+    export at 1024, and a pen quoted in raw pixels would halve between them.
+    """
+    region = Region("stroke", [(0.2, 0.5), (0.8, 0.5)], width=16 / 1023)
+    assert region.mask((1024, 1024))[:, 512].sum() == 16
+    assert region.mask((512, 512))[:, 256].sum() == 8
+
+
+def test_a_single_click_is_a_valid_dab():
+    """One point is a legitimate pen gesture, unlike a one-point lasso."""
+    dot = Region("stroke", [(0.5, 0.5)], width=8 / 63)
+    assert dot.is_valid()
+    assert dot.mask((64, 64)).sum() > 20
+    assert not Region("lasso", [(0.5, 0.5)]).is_valid()
+
+
+def test_a_stroke_with_no_width_is_not_a_pen():
+    """Guards the flag that switches the whole engine into paint mode."""
+    rule = RecolorRule(
+        source_lab=rgb8_to_lab((200, 0, 0)),
+        target_lab=hex_to_lab("#00C800"),
+        region=Region("stroke", [(0.1, 0.5), (0.9, 0.5)], width=0.0),
+    )
+    assert not rule.is_pen
+    assert not rule.region_active
+
+
+def test_pen_takes_every_pixel_it_covers_whatever_the_color(gradient_ctx):
+    """No color ramp: the user pointed at the pixels, so tolerance is moot."""
+    ps = gradient_ctx.full
+    shape = gradient_ctx.shape_full
+    # A tolerance that would match nothing at all if the color path ran.
+    rule = _stroke_rule(tolerance=0.01)
+    assert rule.is_pen
+
+    band = rule.region.mask(shape).reshape(-1)[ps.idx]
+    w = rule_weight(ps, rule, shape=shape)
+    assert band.sum() > 100
+    assert np.array_equal(w > 0, band)
+    assert np.allclose(w[band], 1.0)
+
+    # ...and it really did span both ramps, not just the red one it is sourced
+    # from, which is the case a color rule could never have covered.
+    assert len(np.unique(ps.rgb[band], axis=0)) > 20
+
+
+def test_pen_paints_flat_rather_than_preserving_shading(gradient_ctx):
+    """The one place this engine does not preserve a tonal ramp, on purpose.
+
+    Anchoring the levels curve on the stroke's source color left pixels of any
+    other material barely moved -- red drawn over white came back white, which
+    is not what a pen is for. Shading stays available through the sliders; see
+    the two tests below.
+    """
+    ps = gradient_ctx.full
+    band = _stroke_rule().region.mask(gradient_ctx.shape_full).reshape(-1)[ps.idx]
+    assert len(np.unique(ps.rgb[band], axis=0)) > 20, "source must be varied"
+
+    out = render(gradient_ctx, [_stroke_rule()], use_proxy=False)
+    painted = out.reshape(-1, 4)[ps.idx[band], :3]
+    assert len(np.unique(painted, axis=0)) == 1
+    assert np.allclose(painted[0], hex_to_rgb("#00C800"), atol=3)
+
+
+def test_pen_lightness_shift_gives_the_shading_back(gradient_ctx):
+    """Lightness shift 0 is the documented way to tint instead of fill."""
+    ps = gradient_ctx.full
+    band = _stroke_rule().region.mask(gradient_ctx.shape_full).reshape(-1)[ps.idx]
+
+    rule = _stroke_rule(lightness_amount=0.0)
+    assert np.ptp(ps.L[band]) > 20, "the band must span a real tonal range"
+
+    # Checked on the transform rather than the rendered bytes, because that is
+    # where the claim is exact: every pixel keeps its own L*. By the time the
+    # frame is written, a dark pixel asked for a saturated green has no sRGB
+    # answer, and gamut compression lifts the whole band a couple of L* -- true
+    # of every rule here, not something the pen introduced.
+    assert np.allclose(rule_transform(ps, rule)[band, 0], ps.L[band], atol=1e-4)
+
+    # Measured in L*, not an RGB mean: this fixture's blue and red ramps have
+    # nearly identical channel means at the same row, so an RGB average cannot
+    # tell shading from flatness here at all.
+    out = render(gradient_ctx, [rule], use_proxy=False)
+    painted = out.reshape(-1, 4)[ps.idx[band], :3].astype(np.float32) / 255.0
+    after = rgb_to_lab(painted)[:, 0]
+    assert len(np.unique(np.rint(painted * 255.0), axis=0)) > 5
+    assert np.corrcoef(after, ps.L[band])[0, 1] > 0.97
+
+
+def test_pen_strength_blends_back_toward_the_original(gradient_ctx):
+    ps = gradient_ctx.full
+    band = _stroke_rule().region.mask(gradient_ctx.shape_full).reshape(-1)[ps.idx]
+    idx = ps.idx[band]
+
+    flat = render(gradient_ctx, [_stroke_rule()], use_proxy=False)
+    half = render(gradient_ctx, [_stroke_rule(opacity=0.5)], use_proxy=False)
+    assert len(np.unique(half.reshape(-1, 4)[idx, :3], axis=0)) > 5
+    assert not np.array_equal(flat.reshape(-1, 4)[idx], half.reshape(-1, 4)[idx])
+
+
+def test_pen_never_paints_transparent_pixels(gradient_ctx):
+    """The stroke bounds are the band; the alpha channel is still the law."""
+    # Straight through the transparent top margin of the fixture.
+    rule = RecolorRule(
+        source_lab=rgb8_to_lab((200, 0, 0)),
+        target_lab=hex_to_lab("#00C800"),
+        region=Region("stroke", [(0.0, 0.0), (1.0, 0.0)], width=8 / 63),
+    )
+    out = render(gradient_ctx, [rule], use_proxy=False)
+    clear = gradient_ctx.rgba_full[..., 3] == 0
+    assert clear.any()
+    assert np.array_equal(out[clear], gradient_ctx.rgba_full[clear])
+    assert np.array_equal(out[..., 3], gradient_ctx.rgba_full[..., 3])
+
+
+def test_match_all_cannot_unconfine_a_pen(gradient_ctx):
+    """Match all pixels lifts a confinement; a pen has none to lift.
+
+    It falls out of the pen reading its stroke mask directly rather than being
+    confined by it, so there is no special case guarding this -- which is
+    exactly why it is worth a test. Route a pen back through the color path and
+    one stroke silently becomes a whole-image recolor of whatever it landed on.
+    """
+    ps = gradient_ctx.full
+    shape = gradient_ctx.shape_full
+    confined = rule_weight(ps, _stroke_rule(), shape=shape)
+    lifted = rule_weight(ps, _stroke_rule(match_all=True), shape=shape)
+    assert np.array_equal(confined, lifted)
+    assert lifted.sum() < 0.5 * len(ps), "a lifted pen would claim the image"
+
+
+def test_pen_smooth_edges_feathers_the_band(gradient_ctx):
+    """The one matching control a pen still uses."""
+    ps = gradient_ctx.full
+    shape = gradient_ctx.shape_full
+    hard = rule_weight(ps, _stroke_rule(), shape=shape)
+    soft = rule_weight(ps, _stroke_rule(smooth_edges=True), shape=shape)
+    assert ((hard > 0) & (hard < 1)).sum() == 0
+    assert ((soft > 0) & (soft < 1)).sum() > 20
+
+
+def test_a_stroke_owns_its_band_against_the_rules_below(gradient_ctx):
+    """Which is why the UI puts a new stroke at the top of the list.
+
+    Underneath a broad color rule a stroke is simply painted over -- measured
+    at 83% of one stroke's pixels on a real render -- so a hand-drawn stroke
+    would look like it had done nothing.
+    """
+    ps = gradient_ctx.full
+    shape = gradient_ctx.shape_full
+    pen = _stroke_rule()
+    greedy = RecolorRule(
+        source_lab=rgb8_to_lab((200, 0, 0)),
+        target_lab=hex_to_lab("#0000C8"),
+        tolerance=120,
+    )
+    idx = ps.idx[pen.region.mask(shape).reshape(-1)[ps.idx]]
+
+    alone = render(gradient_ctx, [pen], use_proxy=False)
+    on_top = render(gradient_ctx, [pen, greedy], use_proxy=False)
+    assert np.array_equal(alone.reshape(-1, 4)[idx], on_top.reshape(-1, 4)[idx])
+
+    beneath = render(gradient_ctx, [greedy, pen], use_proxy=False)
+    assert not np.array_equal(alone.reshape(-1, 4)[idx], beneath.reshape(-1, 4)[idx])
+
+
+def test_stroke_width_survives_a_preset_round_trip():
+    from palette_creator.presets import rule_from_dict, rule_to_dict
+
+    rule = _stroke_rule()
+    back = rule_from_dict(rule_to_dict(rule))
+    assert back.is_pen
+    assert back.region.kind == "stroke"
+    assert back.region.width == pytest.approx(rule.region.width)
+    assert back.region.points == rule.region.points
+
+
+def test_stroke_width_is_part_of_the_mask_identity():
+    """Two pens of different size are not the same selection.
+
+    ``fingerprint`` keys the weight cache, so a width missing from it would
+    hand a rethickened stroke the previous stroke's mask.
+    """
+    thin = _stroke_rule()
+    thick = _stroke_rule()
+    thick.region.width *= 2
+    assert thin.region.key() != thick.region.key()
+    assert thin.fingerprint() != thick.fingerprint()
+
+
+@real_assets
+def test_pen_crosses_materials_on_a_real_render(ctx):
+    """The failure the synthetic fixtures could not show.
+
+    On the actual render a stroke over the leg spans an outline, an orange
+    thigh and a white wrap. Under the shading-preserving transform only the
+    thigh visibly moved; every pixel must land on the target instead.
+    """
+    h, w = ctx.shape_full
+    ys, xs = np.nonzero(ctx.rgba_full[..., 3] >= 8)
+    y = int(np.percentile(ys, 55))
+    x0, x1 = int(np.percentile(xs, 30)), int(np.percentile(xs, 70))
+    rule = RecolorRule(
+        source_lab=rgb8_to_lab(ctx.sample_rgb((x0 + x1) // 2, y)),
+        target_lab=hex_to_lab("#DC1E1E"),
+        region=Region(
+            "stroke",
+            [(x0 / (w - 1), y / (h - 1)), (x1 / (w - 1), y / (h - 1))],
+            width=10 / (w - 1),
+        ),
+    )
+
+    ps = ctx.full
+    band = rule.region.mask(ctx.shape_full).reshape(-1)[ps.idx]
+    assert len(np.unique(ps.rgb[band], axis=0)) > 50, "must span several materials"
+
+    out = render(ctx, [rule], use_proxy=False)
+    assert len(np.unique(out.reshape(-1, 4)[ps.idx[band], :3], axis=0)) == 1
+
+    changed = np.any(out[..., :3] != ctx.rgba_full[..., :3], axis=-1)
+    assert changed.sum() == band.sum()
