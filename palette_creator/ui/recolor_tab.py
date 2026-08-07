@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import copy
+import os
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -285,6 +288,11 @@ class RecolorTab(ctk.CTkFrame):
                 (
                     "Load preset", 76, self._load_preset,
                     "Replace the current rules with a saved set.",
+                ),
+                (
+                    "Preset folder", 90, self._open_presets_folder,
+                    "Open the folder your presets are saved in, to rename, "
+                    "delete or share the files.",
                 ),
             )
         ):
@@ -1843,6 +1851,21 @@ class RecolorTab(ctk.CTkFrame):
             text=f"Loaded {Path(chosen).name} — "
             f"{count} rule{'' if count == 1 else 's'}{note}"
         )
+
+    def _open_presets_folder(self) -> None:
+        # Created on the way out rather than only on the first save, so the
+        # button always lands somewhere instead of erroring on a fresh install.
+        PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            if sys.platform == "win32":
+                os.startfile(PRESETS_DIR)  # noqa: S606 -- a directory, not user input
+            else:
+                opener = "open" if sys.platform == "darwin" else "xdg-open"
+                subprocess.Popen([opener, str(PRESETS_DIR)])
+        except Exception as exc:
+            messagebox.showerror("Could not open the folder", str(exc))
+            return
+        self._status.configure(text=f"Opened {PRESETS_DIR}")
 
     def _select_preset_source(self, source: str) -> str:
         """Point the source pickers at the render the preset was saved on, and
