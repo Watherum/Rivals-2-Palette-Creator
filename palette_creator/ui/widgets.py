@@ -95,7 +95,15 @@ class Swatch(tk.Canvas):
 
 
 class Tooltip:
-    """Hover tooltip. Tk has no built-in, and several controls here need one."""
+    """Hover tooltip. Tk has no built-in, and several controls here need one.
+
+    Sits below its control by default, and flips above when that would put it
+    off the bottom of the screen -- which the tall tips on the controls near
+    the foot of the left panel otherwise do.
+    """
+
+    GAP = 6
+    """Pixels between the control and its tip, on whichever side it lands."""
 
     def __init__(self, widget, text: str, delay: int = 550):
         self.widget = widget
@@ -127,16 +135,21 @@ class Tooltip:
         if self._window is not None or not self.text:
             return
         try:
-            x = self.widget.winfo_rootx() + 12
-            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            wx = self.widget.winfo_rootx()
+            wy = self.widget.winfo_rooty()
+            wh = self.widget.winfo_height()
         except tk.TclError:
             return
 
-        self._window = tk.Toplevel(self.widget)
-        self._window.wm_overrideredirect(True)
-        self._window.wm_geometry(f"+{x}+{y}")
+        window = tk.Toplevel(self.widget)
+        window.wm_overrideredirect(True)
+        # Built hidden, then measured, then placed. Deciding whether the tip
+        # fits below its control needs the tip's own height, and that is not
+        # known until the label has been laid out -- placing first and moving
+        # afterwards would show it in the wrong spot for a frame.
+        window.wm_withdraw()
         tk.Label(
-            self._window,
+            window,
             text=self.text,
             justify="left",
             background="#1f1f1f",
@@ -148,6 +161,25 @@ class Tooltip:
             pady=4,
             wraplength=320,
         ).pack()
+        window.update_idletasks()
+
+        tw, th = window.winfo_reqwidth(), window.winfo_reqheight()
+        sw, sh = window.winfo_screenwidth(), window.winfo_screenheight()
+
+        x = wx + 12
+        y = wy + wh + self.GAP
+        if y + th > sh:
+            # No room underneath -- sit above the control instead of hanging
+            # off the bottom of the screen where the text cannot be read.
+            y = max(wy - th - self.GAP, 0)
+        # Same idea sideways, except a tip that overhangs is nudged back rather
+        # than flipped: there is nothing on the other side of the pointer to
+        # flip to, and clamping keeps the whole tip on screen either way.
+        x = max(min(x, sw - tw), 0)
+
+        window.wm_geometry(f"+{x}+{y}")
+        window.wm_deiconify()
+        self._window = window
 
     def _hide(self, _event=None) -> None:
         self._cancel()

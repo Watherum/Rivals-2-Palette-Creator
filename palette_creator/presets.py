@@ -92,14 +92,32 @@ def save_preset(path: Path | str, rules, *, source: str = "") -> Path:
     return path
 
 
-def load_preset(path: Path | str) -> list[RecolorRule]:
+def _read(path: Path | str) -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if data.get("format") != FORMAT_VERSION:
         raise ValueError(
             f"unsupported preset format {data.get('format')!r} "
             f"(this build reads version {FORMAT_VERSION})"
         )
-    return [rule_from_dict(d) for d in data.get("rules", [])]
+    return data
+
+
+def load_preset(path: Path | str) -> list[RecolorRule]:
+    return [rule_from_dict(d) for d in _read(path).get("rules", [])]
+
+
+def load_preset_with_source(path: Path | str) -> tuple[list[RecolorRule], str]:
+    """Rules plus the filename of the render they were saved against.
+
+    The filename is ``""`` for a preset saved with no render loaded, and for
+    anything written before the field existed -- callers have to cope with not
+    knowing rather than treating it as a failure.
+    """
+    data = _read(path)
+    return (
+        [rule_from_dict(d) for d in data.get("rules", [])],
+        str(data.get("source_render") or ""),
+    )
 
 
 def list_presets(directory: Path | str = PRESETS_DIR) -> list[Path]:

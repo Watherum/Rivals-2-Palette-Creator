@@ -12,6 +12,7 @@ import customtkinter as ctk
 from .. import __version__
 from .download_tab import DownloadTab
 from .recolor_tab import RecolorTab
+from .reference_tab import ReferenceTab
 
 
 class App(ctk.CTk):
@@ -20,7 +21,7 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        self.title(f"Rivals 2 Palette Creator {__version__}")
+        self.title(f"Rivals 2 Palette Creator {__version__} Powered by Watherum")
         self.geometry("1480x920")  # what restoring down returns to
         self.minsize(1180, 760)
         self.after(0, self._maximize)
@@ -28,10 +29,14 @@ class App(ctk.CTk):
         self.tabs = ctk.CTkTabview(self, anchor="nw")
         self.tabs.pack(fill="both", expand=True, padx=8, pady=8)
         self.tabs.add("Recolor")
+        self.tabs.add("Reference")
         self.tabs.add("Downloads")
 
         self.recolor_tab = RecolorTab(self.tabs.tab("Recolor"), app=self)
         self.recolor_tab.pack(fill="both", expand=True)
+
+        self.reference_tab = ReferenceTab(self.tabs.tab("Reference"), app=self)
+        self.reference_tab.pack(fill="both", expand=True)
 
         self.download_tab = DownloadTab(self.tabs.tab("Downloads"), app=self)
         self.download_tab.pack(fill="both", expand=True)
@@ -88,7 +93,7 @@ class App(ctk.CTk):
     def _on_close(self) -> None:
         """Tear the tabs down explicitly so their timers are cancelled before
         the interpreter goes away."""
-        for tab in (self.recolor_tab, self.download_tab):
+        for tab in (self.recolor_tab, self.reference_tab, self.download_tab):
             try:
                 tab.destroy()
             except Exception:

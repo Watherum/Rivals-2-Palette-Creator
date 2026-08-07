@@ -17,9 +17,9 @@ from scipy import ndimage
 from ..colorspace import hex_to_rgb, lab_to_hex, rgb8_to_lab, rgb_to_hex
 from ..config import EXPORT_DIR, KMEANS_DEFAULT_K, PRESETS_DIR
 from ..imagectx import ContextCache
-from ..library import Library
+from ..library import Library, parse_stem
 from ..palette_extract import Swatch, extract_palette, seed_for_path
-from ..presets import load_preset, save_preset
+from ..presets import load_preset_with_source, save_preset
 from ..recolor import MatchMode, RecolorRule, Region, render, rule_weight
 from .color_wheel import ColorEditor
 from .image_canvas import ImageCanvas
@@ -225,24 +225,27 @@ class RecolorTab(ctk.CTkFrame):
         # panel next to the rest of the selection controls.
         bar = ctk.CTkFrame(panel, fg_color="transparent")
         bar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        bar.grid_columnconfigure(4, weight=1)
+        bar.grid_columnconfigure(2, weight=1)
 
         self._view = ctk.CTkSegmentedButton(
             bar,
-            values=["Original", "Preview", "Selection"],
+            values=["Original", "Selection", "Preview"],
             command=self._on_view_change,
         )
         self._view.set("Preview")
         self._view.grid(row=0, column=0, sticky="w")
 
-        self._fit_btn = ctk.CTkButton(
-            bar, text="Fit", width=48, height=28, command=self._fit
-        )
-        self._fit_btn.grid(row=0, column=1, padx=(8, 0))
+        # History and the file actions share one container so they move as a
+        # unit when the bar wraps. Gridded straight into the bar they would
+        # each claim a column of their own, and a wrapped row's columns still
+        # size the row above it -- which starves the zoom group of the width it
+        # needs and clips the readout off the right-hand end.
+        secondary = ctk.CTkFrame(bar, fg_color="transparent")
+        secondary.grid(row=0, column=1, padx=(10, 0), sticky="w")
+        self._secondary = secondary
 
-        history = ctk.CTkFrame(bar, fg_color="transparent")
-        history.grid(row=0, column=2, padx=(10, 0), sticky="w")
-        self._history_group = history
+        history = ctk.CTkFrame(secondary, fg_color="transparent")
+        history.grid(row=0, column=0, sticky="w")
         self._undo_btn = ctk.CTkButton(
             history, text="↶", width=34, height=28, state="disabled",
             command=self.undo,
@@ -257,9 +260,8 @@ class RecolorTab(ctk.CTkFrame):
         self._redo_btn.grid(row=0, column=1, padx=1)
         Tooltip(self._redo_btn, "Redo   (Ctrl+R, or Ctrl+Y)")
 
-        files = ctk.CTkFrame(bar, fg_color="transparent")
-        files.grid(row=0, column=3, padx=(12, 0), sticky="w")
-        self._file_actions = files
+        files = ctk.CTkFrame(secondary, fg_color="transparent")
+        files.grid(row=0, column=1, padx=(12, 0), sticky="w")
         for col, (text, width, command, tip) in enumerate(
             (
                 (
@@ -289,11 +291,20 @@ class RecolorTab(ctk.CTkFrame):
             Tooltip(btn, tip)
 
         zoom_box = ctk.CTkFrame(bar, fg_color="transparent")
-        zoom_box.grid(row=0, column=4, sticky="e", padx=(12, 0))
+        zoom_box.grid(row=0, column=2, sticky="e", padx=(12, 0))
         self._zoom_box = zoom_box
 
+        # Fit lives here rather than by the view switch: it is a zoom control,
+        # not a view mode -- it scales the render to the viewport, and reads as
+        # the far end of the same slider.
+        self._fit_btn = ctk.CTkButton(
+            zoom_box, text="Fit", width=48, height=28, command=self._fit
+        )
+        self._fit_btn.grid(row=0, column=0, padx=(0, 10))
+        Tooltip(self._fit_btn, "Zoom so the whole render fits the canvas.")
+
         ctk.CTkLabel(zoom_box, text="Zoom", font=FONT_SMALL, anchor="e").grid(
-            row=0, column=0, padx=(0, 6)
+            row=0, column=1, padx=(0, 6)
         )
 
         self._zoom_slider = ctk.CTkSlider(
@@ -305,7 +316,7 @@ class RecolorTab(ctk.CTkFrame):
             command=self._on_zoom_slider,
         )
         self._zoom_slider.set(0.0)
-        self._zoom_slider.grid(row=0, column=1)
+        self._zoom_slider.grid(row=0, column=2)
         Tooltip(
             self._zoom_slider,
             f"Zoom the canvas, {2 ** ZOOM_LOG_MIN:.0%} to {2 ** ZOOM_LOG_MAX:.0%}. "
@@ -319,7 +330,7 @@ class RecolorTab(ctk.CTkFrame):
             zoom_box, text="", font=FONT_MONO, width=52, anchor="e",
             text_color="#5fbf5f",
         )
-        self._hq.grid(row=0, column=2, padx=(6, 6))
+        self._hq.grid(row=0, column=3, padx=(6, 6))
         Tooltip(
             self._hq,
             "Canvas zoom. 100% is one screen pixel per render pixel.\n\n"
@@ -346,25 +357,30 @@ class RecolorTab(ctk.CTkFrame):
     def _reflow_toolbar(self, event) -> None:
         """One row when it fits, two when it does not.
 
+        History and the file actions drop together as one group, leaving row 0
+        as the view switch and the zoom group. Dropping the file actions alone
+        used to be enough; with Fit now inside the zoom group row 0 wants
+        554px, and at the window's minimum size the centre panel has about 500
+        to give -- so the zoom readout fell off the right-hand end. View plus
+        zoom is 472.
+
         The small gap between the two thresholds is only there to keep a
         boundary pixel from flapping: wrapping changes the bar's height, not
         its width, so the decision does not feed back into its own input.
         """
+        # Fit is inside the zoom group now, so it is already counted there.
         need = 24 + sum(
             w.winfo_reqwidth()
-            for w in (
-                self._view, self._fit_btn, self._history_group,
-                self._file_actions, self._zoom_box,
-            )
+            for w in (self._view, self._secondary, self._zoom_box)
         )
-        wrapped = int(self._file_actions.grid_info().get("row", 0)) == 1
+        wrapped = int(self._secondary.grid_info().get("row", 0)) == 1
         if not wrapped and event.width < need:
-            self._file_actions.grid(
-                row=1, column=0, columnspan=5, sticky="w", padx=0, pady=(5, 0)
+            self._secondary.grid(
+                row=1, column=0, columnspan=3, sticky="w", padx=0, pady=(5, 0)
             )
         elif wrapped and event.width > need + 16:
-            self._file_actions.grid(
-                row=0, column=3, columnspan=1, sticky="w", padx=(12, 0), pady=0
+            self._secondary.grid(
+                row=0, column=1, columnspan=1, sticky="w", padx=(10, 0), pady=0
             )
 
     # ----------------------------------------------------------------- right
@@ -399,9 +415,9 @@ class RecolorTab(ctk.CTkFrame):
         self._add_rule_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
         Tooltip(
             self._add_rule_btn,
-            "Adds a rule. With a Box or Lasso region drawn, the new rule is "
-            "confined to it and takes its source color from the dominant "
-            "material inside it.",
+            "Adds a rule for the render's biggest color.\n\n"
+            "You do not need this for an area: Box and Lasso make their own "
+            "rule the moment you finish drawing.",
         )
         ctk.CTkButton(
             add, text="Clear all", height=28, fg_color="#5a3a3a",
@@ -522,7 +538,9 @@ class RecolorTab(ctk.CTkFrame):
                 (
                     "rect",
                     "▭ Box",
-                    "Drag a box on the image to claim an area for one rule.\n\n"
+                    "Drag a box on the image to claim an area for one rule. "
+                    "Releasing makes the rule, sourced from the dominant "
+                    "material inside the box.\n\n"
                     "The rule is confined to it, and it owns it: no rule below "
                     "it in the list can paint inside, so a broad rule cannot "
                     "creep back over a part you separated out.",
@@ -531,7 +549,7 @@ class RecolorTab(ctk.CTkFrame):
                     "lasso",
                     "◌ Lasso",
                     "Draw a freehand outline around a part. Released strokes "
-                    "close automatically.\n\n"
+                    "close automatically and make their rule right away.\n\n"
                     "Same ownership as Box: rules below cannot paint inside it.",
                 ),
             )
@@ -558,8 +576,11 @@ class RecolorTab(ctk.CTkFrame):
         self._apply_region_btn.grid(row=2, column=0, sticky="ew", pady=(9, 6))
         Tooltip(
             self._apply_region_btn,
-            "Confine the selected rule to the region you just drew, instead of "
-            "making a new rule for it.",
+            "Confine the selected rule to a shape that is still waiting to be "
+            "claimed.\n\n"
+            "A finished Box or Lasso normally makes its own rule, so this only "
+            "has something to act on when that could not be done -- an empty "
+            "area, or no render loaded.",
         )
 
         mode_row = ctk.CTkFrame(box, fg_color="transparent")
@@ -609,30 +630,10 @@ class RecolorTab(ctk.CTkFrame):
             "is the override for temporarily seeing the rule unconfined.",
         )
 
-        self._contiguous = ctk.CTkCheckBox(
-            box, text="This region only", font=FONT_SMALL,
-            command=self._sync_rule_from_ui,
-        )
-        self._contiguous.grid(row=7, column=0, sticky="w", pady=2)
-        Tooltip(
-            self._contiguous,
-            "Restrict the rule to one connected blob -- the one you clicked, or "
-            "the largest one if the rule came from a palette swatch.\n\n"
-            "Weak on this game's renders: shading in 'material' mode usually "
-            "bridges separate parts into a single blob. Draw a Box or Lasso "
-            "region instead when this does not separate what you expect.",
-        )
-
         self._smooth = ctk.CTkCheckBox(
             box, text="Smooth edges", font=FONT_SMALL, command=self._sync_rule_from_ui
         )
-        self._smooth.grid(row=8, column=0, sticky="w", pady=2)
-
-        self._lock_cluster = ctk.CTkCheckBox(
-            box, text="Lock to palette swatch", font=FONT_SMALL,
-            command=self._sync_rule_from_ui,
-        )
-        self._lock_cluster.grid(row=9, column=0, sticky="w", pady=2)
+        self._smooth.grid(row=7, column=0, sticky="w", pady=2)
 
         return box
 
@@ -849,8 +850,8 @@ class RecolorTab(ctk.CTkFrame):
 
         # Restrict to the cluster's largest connected blob first. A material
         # scatters specks of its own color across the sheet, and seeding into
-        # one of those would make "This region only" keep the speck and discard
-        # the actual part.
+        # one of those would anchor the rule to a speck rather than to the
+        # actual part.
         plane = np.zeros(h * w, dtype=bool)
         plane[ps.idx[member]] = True
         labeled, count = ndimage.label(plane.reshape(h, w))
@@ -879,23 +880,35 @@ class RecolorTab(ctk.CTkFrame):
         if active:
             self._status.configure(
                 text=f"Drag on the image to draw a "
-                f"{'box' if mode == 'rect' else 'lasso'} region."
+                f"{'box' if mode == 'rect' else 'lasso'} region. "
+                "Releasing it makes a rule for that area."
             )
 
     def _on_region_drawn(self, kind: str, points: list) -> None:
-        """Hold the drawn shape as *pending*, attached to no rule yet.
+        """A finished shape immediately becomes a rule for that area.
 
-        Drawing does not silently rewrite whatever rule happened to be selected;
-        the region is committed by "+ Add rule" (a new rule for that area) or by
-        "Apply region to this rule".
+        The shape is still staged through ``_pending_region`` rather than
+        written onto a rule directly, so the new rule picks it up by the one
+        path everything else uses -- and so the fallbacks below leave it sitting
+        there for the buttons instead of losing the user's stroke.
+
+        Drawing still never rewrites the rule that happened to be selected: it
+        adds a rule of its own and selects that, which is the thing the old
+        two-step guarded against.
         """
         self._pending_region = Region(kind=kind, points=points)
         self.canvas.set_draw_mode(None)
+
+        rule = self._rule_for_region(self._pending_region) if self.ctx else None
+        if rule is None:
+            # No render loaded, or nothing opaque inside the shape. Keep it
+            # pending so the region buttons can still act on it -- and so a
+            # lasso around empty space is not silently thrown away.
+            self._refresh_region_controls()
+            return
+
+        self._append_rule(rule)  # consumes the pending region onto the new rule
         self._refresh_region_controls()
-        self._status.configure(
-            text="Region drawn. '+ Add rule' makes a rule for it, or "
-            "'Apply region to this rule' confines the selected rule."
-        )
 
     def _consume_pending_region(self, rule: RecolorRule) -> bool:
         """Move any pending region onto ``rule``. Returns whether one moved."""
@@ -1274,9 +1287,7 @@ class RecolorTab(ctk.CTkFrame):
             self._chroma.set(rule.chroma_amount)
             self._opacity.set(rule.opacity)
             for widget, flag in (
-                (self._contiguous, rule.contiguous),
                 (self._smooth, rule.smooth_edges),
-                (self._lock_cluster, rule.lock_to_cluster),
                 (self._match_all, rule.match_all),
             ):
                 widget.select() if flag else widget.deselect()
@@ -1301,9 +1312,7 @@ class RecolorTab(ctk.CTkFrame):
         rule.lightness_amount = self._lightness.get()
         rule.chroma_amount = self._chroma.get()
         rule.opacity = self._opacity.get()
-        rule.contiguous = bool(self._contiguous.get())
         rule.smooth_edges = bool(self._smooth.get())
-        rule.lock_to_cluster = bool(self._lock_cluster.get())
         rule.match_all = bool(self._match_all.get())
         self._refresh_rows()
         self._request_preview()
@@ -1369,8 +1378,11 @@ class RecolorTab(ctk.CTkFrame):
             self.selected.source_lab = source
             self.selected.seed_uv = seed_uv
             self.selected.cluster_id = None
+            # Repointing the source detaches the rule from its cluster, so the
+            # lock a loaded preset may carry has nothing left to lock to. There
+            # is no control for it any more, so clearing it here is the only
+            # way it comes off.
             self.selected.lock_to_cluster = False
-            self._lock_cluster.deselect()
             # Re-picking the source of an untouched rule keeps it pending.
             if was_identity:
                 self.selected.target_lab = source.copy()
@@ -1591,11 +1603,16 @@ class RecolorTab(ctk.CTkFrame):
         if not chosen:
             return
         try:
-            loaded = load_preset(Path(chosen))
+            loaded, source = load_preset_with_source(Path(chosen))
         except Exception as exc:
             messagebox.showerror("Could not load preset", str(exc))
             return
         self._push_undo("load preset")
+
+        # Switch the render before the rules go in: _load_render writes its own
+        # status line, and doing it after would stamp over the summary below.
+        note = self._select_preset_source(source)
+
         self.rules = loaded
         self.selected = self.rules[-1] if self.rules else None
         self._weight_cache.clear()
@@ -1603,7 +1620,66 @@ class RecolorTab(ctk.CTkFrame):
         if self.selected is not None:
             self._sync_ui_from_rule()
         self._request_preview()
-        self._status.configure(text=f"Loaded {len(self.rules)} rule(s)")
+        count = len(self.rules)
+        self._status.configure(
+            text=f"Loaded {Path(chosen).name} — "
+            f"{count} rule{'' if count == 1 else 's'}{note}"
+        )
+
+    def _select_preset_source(self, source: str) -> str:
+        """Point the source pickers at the render the preset was saved on, and
+        return a note for the status line.
+
+        All three of character, skin and palette, so loading a preset puts you
+        back on exactly the render it was built against.
+        """
+        if not source:
+            return ""
+        parsed = parse_stem(Path(source).stem)
+        if parsed is None:
+            return ""
+        code, skin, palette = parsed
+
+        current = self._character.get()
+        character = self._character_for_code(code) or current
+
+        if skin not in self.library.skins(character) or palette not in (
+            self.library.palettes(character, skin)
+        ):
+            return f" · saved on {skin}/{palette}, which {character} does not have"
+
+        if (current, self._skin.get(), self._palette.get()) == (
+            character, skin, palette
+        ):
+            return ""
+
+        # Set all three before loading anything. Going through _on_character or
+        # _on_skin would reset the pickers below them to their first entry
+        # instead of the preset's, and load a render on the way past.
+        self._character.set(character)
+        self._skin.configure(values=self.library.skins(character))
+        self._skin.set(skin)
+        self._palette.configure(values=self.library.palettes(character, skin))
+        self._palette.set(palette)
+        self._on_palette(palette)
+
+        where = f"{skin}/{palette}"
+        if character != current:
+            where = f"{character} {where}"
+        return f" · switched to {where}"
+
+    def _character_for_code(self, code: str) -> str | None:
+        """The character whose renders carry ``code``, as seen on disk.
+
+        Matched through the library rather than read straight off the filename:
+        the prefix is not authoritative -- Random ships ``T_Ran_*`` files that
+        are not Ranno's -- whereas ``code_for`` reports what a character's own
+        folder actually holds.
+        """
+        for character in self.library.characters():
+            if self.library.code_for(character) == code:
+                return character
+        return None
 
 
 def _hex_pairs(value: str):

@@ -105,7 +105,8 @@ class SwatchStrip(ctk.CTkFrame):
             if swatch.spans_materials and self._flag_spans:
                 tip += (
                     "\n\nThis color spans multiple materials.\n"
-                    "Use 'This region only' or a tighter tolerance."
+                    "Draw a Box or Lasso around the part you want, or use a "
+                    "tighter tolerance."
                 )
             if self._tooltip_suffix:
                 tip += f"\n\n{self._tooltip_suffix}"

@@ -75,8 +75,8 @@ red→blue and blue→green cannot double-apply.
   hue and saturation. This is usually what you want for a subtle palette swap.
 - **Edge softness** widens the ramp between selected and unselected, which is
   what keeps antialiased edges clean.
-- **This region only** restricts a rule to the connected region you clicked —
-  the way to separate two parts that happen to share a color.
+- **Box / Lasso** confine a rule to an area you draw — the way to separate two
+  parts that happen to share a color. Finishing the shape creates the rule.
 - **Strength** is how far toward the target color a pixel moves, not layer
   opacity. Turning a rule down reveals the *original art*, never the rule below
   it — see the ownership rule above.
@@ -136,8 +136,8 @@ downweighting.
 The first row is the important one: **the game recolors by material/UV region,
 not by color**, so no color-driven tool can reproduce an official palette
 exactly. Two parts that share a color in Neutral can diverge in Red. When that
-bites, use **This region only** — it is the one spatial discriminator available
-when color alone cannot separate two materials.
+bites, draw a **Box** or **Lasso** — that is the spatial discriminator
+available when color alone cannot separate two materials.
 
 The third and fourth rows are why a cluster is never flat-filled, and why
 lightness is not compressed before clustering.
