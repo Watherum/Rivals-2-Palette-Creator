@@ -230,6 +230,10 @@ throws away where you were looking.
 
 ```
 main.py                     entry point
+install_requirements.bat    one-time dependency install
+RUN_PALETTE_CREATOR.bat     launch
+run_debug.bat               launch with a console
+MAKE_RELEASE.bat            zip a release into dist/            (dev only)
 palette_creator/
   config.py                 paths and tunable constants
   library.py                scans the renders into character/skin/palette
@@ -240,11 +244,14 @@ palette_creator/
   downloader.py             dragdown.wiki, GUI + CLI
   presets.py                rule sets as JSON
   ui/                       CustomTkinter widgets
+Python_Scripts/
+  download_rivals_renders.py   the downloader as a standalone CLI
 scripts/
   check_env.py              interpreter and package versions
-  validate_assets.py        open every PNG, report corruption
-  bench_recolor.py          accuracy against the official palettes
-tests/                      pytest
+  validate_assets.py        open every PNG, report corruption    (dev only)
+  bench_recolor.py          accuracy against official palettes   (dev only)
+  make_release.py           build the release zip                (dev only)
+tests/                      pytest                               (dev only)
 Resources/
   Character_Renders_Source/ downloaded renders (never modified)
   Character_Renders_Custom/ your exports
@@ -264,6 +271,34 @@ survive retargeting, lightness ordering never inverts, and rules never cascade.
 The pen has its own set: a stroke rasterizes to the same band at proxy and full
 resolution, takes every pixel it covers whatever the color, paints flat, and
 never reaches a transparent pixel.
+
+## Releases
+
+```
+MAKE_RELEASE.bat                                 source only, ~85 KB
+MAKE_RELEASE.bat --include-renders               adds the 382 MB render tree
+python scripts\make_release.py --force           overwrite an existing zip
+```
+
+Writes `dist\Rivals-2-Palette-Creator-v<version>.zip`, versioned from
+`palette_creator.__version__` and rooted in a single folder so extracting never
+sprays the current directory. Re-running refuses to clobber an existing archive
+until you pass `--force`.
+
+The zip carries only what an end user needs to install, run, and troubleshoot:
+the package, the three launch scripts, `requirements.txt`, this README,
+`check_env.py`, and the downloader CLI. Everything marked *(dev only)* above is
+left out — `pytest` is not in `requirements.txt`, so a release recipient could
+not run the tests anyway. `run_debug.bat` ships precisely because
+`RUN_PALETTE_CREATOR.bat` launches through `pythonw.exe` with no console:
+without it, a failed start is silent and leaves the user nothing to report.
+
+Renders are excluded by default, since the Downloads tab refetches them. When
+included they are **stored rather than deflated** — PNG data is already
+compressed, and deflating it *grew* the archive from 382 MB to 418 MB. No step
+in the release path decodes or re-encodes an image; every archived file is
+byte-identical to its source, which the build verifies by CRC-32 against the
+original bytes before it reports success.
 
 ## Notes on the asset set
 
