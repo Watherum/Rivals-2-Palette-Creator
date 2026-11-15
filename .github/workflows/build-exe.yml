@@ -1,0 +1,62 @@
+name: Build exe
+
+# Builds the standalone Windows exe.
+#   - Run it by hand from the Actions tab: the exe is attached to the run as an artifact.
+#   - Push a tag like v1.0.1: the exe is also attached to a GitHub release for that tag.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # create the release on a tag push
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Install dependencies
+        run: >-
+          python -m pip install --only-binary=:all:
+          -r requirements.txt -r requirements-build.txt pytest
+
+      - name: Check the tag matches __version__
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(python -c "import palette_creator; print(palette_creator.__version__)")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match __version__ $version in palette_creator/__init__.py"
+            exit 1
+          fi
+
+      - name: Tests
+        run: python -m pytest -m "not network" -q
+
+      # The runner is already a clean environment, so no venv is needed here.
+      - name: Build and smoke test the exe
+        run: python scripts/build_exe.py --no-venv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Rivals-2-Palette-Creator-exe
+          path: dist/*.exe
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe
+          generate_release_notes: true

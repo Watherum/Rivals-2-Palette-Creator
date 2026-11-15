@@ -104,10 +104,14 @@ class App(ctk.CTk):
         """Surface widget-callback exceptions instead of letting Tk swallow
         them into stderr, which pythonw.exe discards."""
         traceback.print_exception(exc_type, value, tb)
+        if getattr(sys, "frozen", False):
+            # The exe has no console and no run_debug.bat, so the dialog is
+            # the only place the traceback can go.
+            detail = "".join(traceback.format_exception(exc_type, value, tb))[-1500:]
+        else:
+            detail = "Run run_debug.bat to see the full traceback."
         messagebox.showerror(
-            "Unexpected error",
-            f"{exc_type.__name__}: {value}\n\n"
-            "Run run_debug.bat to see the full traceback.",
+            "Unexpected error", f"{exc_type.__name__}: {value}\n\n{detail}"
         )
 
 

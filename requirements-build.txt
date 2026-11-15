@@ -1,0 +1,4 @@
+# Build-only dependencies for the standalone exe (scripts/build_exe.py).
+# Not needed to run the app from source.
+
+pyinstaller>=6.16         # first line with Python 3.14 support

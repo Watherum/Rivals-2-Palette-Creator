@@ -293,8 +293,13 @@ def rule_distance(ps: PixelSet, rule: RecolorRule) -> np.ndarray:
         gate = np.clip((ps.C - CHROMA_EPS) / 8.0, 0.0, 1.0)
         return (dh * max(c0, 1.0) / np.maximum(gate, 1e-3)).astype(np.float32)
 
-    da = ps.a - a0
-    db = ps.b - b0
+    # Matched on the denoised colors: the weight ramp is steep, and on the raw
+    # pixels the renders' 4x4 block noise turns into a splotched selection.
+    sel = ps.sel_lab
+    L, a, b, C = sel[:, 0], sel[:, 1], sel[:, 2], ps.sel_C
+
+    da = a - a0
+    db = b - b0
     ab2 = da * da + db * db
 
     wl = rule.effective_l_weight
@@ -305,16 +310,30 @@ def rule_distance(ps: PixelSet, rule: RecolorRule) -> np.ndarray:
         d2 = ab2
     else:
         # Split the (a*, b*) offset into chroma and hue parts. The identity
-        # dH^2 = da^2 + db^2 - dC^2 avoids any trigonometry, and stays
-        # well-behaved near neutral -- grays sit at the origin, so they match
-        # grays rather than matching every hue as a raw angle would.
+        # dH^2 = da^2 + db^2 - dC^2 avoids any trigonometry.
         c0 = float(np.hypot(a0, b0))
-        dc = ps.C - c0
+        dc = C - c0
         dh2 = np.maximum(ab2 - dc * dc, 0.0)
         d2 = dh2 + (wc * wc) * (dc * dc)
 
+        if c0 > 1e-3:
+            # That polar split is singular at the neutral axis: a gray pixel
+            # one unit to either side of it reads as the source's hue or as
+            # its opposite, which against a chroma-35 source is a swing of 20
+            # in dH from two units of noise. So near neutral, split along the
+            # *source's* hue axis instead -- radial is toward/away from the
+            # source's hue, tangential is across it -- which is linear in the
+            # pixel and has no singularity. Faded in by the pixel's chroma, so
+            # anything with a real hue of its own is measured as before.
+            ux, uy = a0 / c0, b0 / c0
+            dr = a * ux + b * uy - c0
+            dt = b * ux - a * uy
+            cart = dt * dt + (wc * wc) * (dr * dr)
+            gate = np.clip((C - CHROMA_EPS) / 8.0, 0.0, 1.0)
+            d2 = gate * d2 + (1.0 - gate) * cart
+
     if wl > 0.0:
-        dl = (ps.L - L0) * wl
+        dl = (L - L0) * wl
         d2 = d2 + dl * dl
 
     return np.sqrt(d2, dtype=np.float32)
@@ -540,16 +559,33 @@ def rule_transform(ps: PixelSet, rule: RecolorRule) -> np.ndarray:
     l_new = _anchored(ps.L, ls, lt, 100.0)
     l_out = ps.L + rule.lightness_amount * (l_new - ps.L)
 
-    if cs < CHROMA_EPS:
-        # A gray source has no hue to rotate: tint additively and adopt the
-        # target's hue outright.
+    gray_source = cs < CHROMA_EPS
+    if gray_source:
         c_new = np.clip(ps.C + ct, 0.0, CHROMA_MAX)
-        h_out = np.full_like(ps.h, ht)
     else:
         c_new = _anchored(ps.C, cs, ct, CHROMA_MAX, max_gain=CHROMA_GAIN_MAX)
+    c_out = ps.C + rule.chroma_amount * (c_new - ps.C)
+    c_out = np.clip(c_out, 0.0, CHROMA_MAX)
+
+    if gray_source:
+        # A gray source has no hue to rotate: tint additively and adopt the
+        # target's hue outright.
+        h_out = np.full_like(ps.h, ht)
+    else:
         hs = float(np.arctan2(bs, a_s))
         dh = float(np.angle(np.exp(1j * (ht - hs))))  # shortest signed rotation
-        rotated = ps.h + rule.hue_amount * dh
+
+        # Each pixel keeps its own offset from the source hue -- that is what
+        # preserves a material's hue variation -- but the offset must not be
+        # *amplified*. Hue is an angle, so a pixel lifted from chroma 7 to
+        # chroma 70 has its hue noise magnified tenfold in real color terms,
+        # and a pale material's block noise comes back as purple and cyan
+        # blotches. Scale the offset down so the sideways displacement grows
+        # by no more than the chroma gain cap. A no-op whenever chroma was
+        # not boosted past that cap, which is every ordinary recolor.
+        dev = np.angle(np.exp(1j * (ps.h - hs)))
+        keep = np.clip(CHROMA_GAIN_MAX * ps.C / np.maximum(c_out, 1e-3), 0.0, 1.0)
+        rotated = hs + rule.hue_amount * dh + keep * dev
 
         # A near-neutral *pixel* has no meaningful hue either, whatever the
         # source's chroma was: its h is 8-bit quantization noise around the
@@ -564,9 +600,6 @@ def rule_transform(ps: PixelSet, rule: RecolorRule) -> np.ndarray:
         gate = np.clip((ps.C - CHROMA_EPS) / 8.0, 0.0, 1.0)
         blended = gate * np.exp(1j * rotated) + (1.0 - gate) * np.exp(1j * ht)
         h_out = np.angle(blended).astype(np.float32)
-
-    c_out = ps.C + rule.chroma_amount * (c_new - ps.C)
-    c_out = np.clip(c_out, 0.0, CHROMA_MAX)
 
     return np.stack(
         [l_out, c_out * np.cos(h_out), c_out * np.sin(h_out)], axis=1

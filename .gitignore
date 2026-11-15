@@ -7,6 +7,7 @@ dist/
 
 # --- virtualenvs (project runs on a global interpreter, but just in case) ---
 .venv/
+.venv-build/
 venv/
 env/
 

@@ -129,8 +129,8 @@ def test_real_tree_shape():
     assert "Ranno" in chars and "La Reina" in chars
     assert "Random" not in chars
 
-    # Clairen's 103 files collapse to 98 once the 5 percent-encoded twins hide.
-    assert len(lib.palettes("Clairen", "Léon")) == 5
+    # Léon has 6 palettes; the 5 percent-encoded twins (Gold has none) hide.
+    assert len(lib.palettes("Clairen", "Léon")) == 6
     assert len(lib.duplicates) == 5
     assert all("%" in p.stem for p in lib.duplicates)
 

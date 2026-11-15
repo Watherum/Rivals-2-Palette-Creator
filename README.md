@@ -234,6 +234,8 @@ install_requirements.bat    one-time dependency install
 RUN_PALETTE_CREATOR.bat     launch
 run_debug.bat               launch with a console
 MAKE_RELEASE.bat            zip a release into dist/            (dev only)
+BUILD_EXE.bat               build the standalone exe into dist/ (dev only)
+palette_creator.spec        PyInstaller recipe for the exe      (dev only)
 palette_creator/
   config.py                 paths and tunable constants
   library.py                scans the renders into character/skin/palette
@@ -251,6 +253,7 @@ scripts/
   validate_assets.py        open every PNG, report corruption    (dev only)
   bench_recolor.py          accuracy against official palettes   (dev only)
   make_release.py           build the release zip                (dev only)
+  build_exe.py              build and smoke test the exe         (dev only)
 tests/                      pytest                               (dev only)
 Resources/
   Character_Renders_Source/ downloaded renders (never modified)
@@ -299,6 +302,43 @@ compressed, and deflating it *grew* the archive from 382 MB to 418 MB. No step
 in the release path decodes or re-encodes an image; every archived file is
 byte-identical to its source, which the build verifies by CRC-32 against the
 original bytes before it reports success.
+
+## Standalone exe
+
+```
+BUILD_EXE.bat                                    dist\Rivals-2-Palette-Creator-v<version>.exe
+BUILD_EXE.bat --include-renders                  also zips the exe with the render tree
+BUILD_EXE.bat --clean                            rebuild the build venv and caches first
+```
+
+One windowed exe, about 60 MB, that runs on a Windows machine with no Python
+installed. It keeps its data in a `Resources` folder **next to the exe**
+(created on first download, export or preset save), so put the exe in a folder
+of its own rather than somewhere read-only. Renders come from the Downloads tab
+or from the `--include-renders` zip.
+
+`scripts\build_exe.py` does the work in three steps:
+
+1. Creates a private venv, `.venv-build`, with only `requirements.txt` and
+   PyInstaller. PyInstaller bundles whatever the interpreter can import, so
+   building from the global Python would drag unrelated packages in.
+2. Runs `palette_creator.spec`. The version comes from
+   `palette_creator.__version__`; drop a `Resources\app.ico` in to give the exe
+   an icon.
+3. Copies the exe to an empty temp folder and starts it with `--smoke-test`,
+   which imports every dependency, round-trips a color through scikit-image,
+   and builds the real window once. The build fails unless that passes, so a
+   module or data file PyInstaller missed is caught here rather than on a
+   user's machine.
+
+The first build takes a few minutes; later ones reuse the venv and the
+PyInstaller cache. The exe unpacks itself on every launch, so expect a few
+seconds before the window appears.
+
+`.github\workflows\build-exe.yml` runs the same build on GitHub: start it by
+hand from the Actions tab to get the exe as a run artifact, or push a tag that
+matches `__version__` (`git tag v1.0.1 && git push origin v1.0.1`) to have the
+exe attached to a GitHub release.
 
 ## Notes on the asset set
 

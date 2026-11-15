@@ -1,8 +1,21 @@
 """Paths and tunable constants shared across the app."""
 
+import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+def _project_root() -> Path:
+    """Folder that holds Resources/.
+
+    In the PyInstaller exe, __file__ points into a temp folder that is deleted
+    on exit, so downloads, exports and presets go next to the exe instead.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+PROJECT_ROOT = _project_root()
 RESOURCES_DIR = PROJECT_ROOT / "Resources"
 SOURCE_DIR = RESOURCES_DIR / "Character_Renders_Source"
 EXPORT_DIR = RESOURCES_DIR / "Character_Renders_Custom"
@@ -50,6 +63,17 @@ ALPHA_MIN_CLUSTER = 128
 Antialiased edge pixels in a straight-alpha PNG carry blended RGB that would
 otherwise create phantom clusters.
 """
+
+SELECT_DENOISE_RADIUS = 3
+"""Window radius of the selection denoise. 3 gives 7x7, enough to span one 4x4
+texture-compression block from any pixel inside it."""
+
+SELECT_DENOISE_SIGMA_S = 2.0
+"""Spatial falloff of the selection denoise, in pixels."""
+
+SELECT_DENOISE_SIGMA_R = 5.0
+"""Color falloff of the selection denoise, in LAB units. Block noise is a few
+units and gets averaged; a material boundary is tens of units and does not."""
 
 PROXY_SIZE = 512
 """Edge length of the interactive preview proxy. Full res is used on export."""

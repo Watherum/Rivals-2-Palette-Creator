@@ -873,3 +873,109 @@ def test_pen_crosses_materials_on_a_real_render(ctx):
 
     changed = np.any(out[..., :3] != ctx.rgba_full[..., :3], axis=-1)
     assert changed.sum() == band.sum()
+
+
+# -- block noise ------------------------------------------------------------
+#
+# The renders come out of block-compressed textures and carry a few levels of
+# 4x4 block noise. It is invisible in the art, but the engine used to amplify
+# it into splotches in three separate ways; one test for each.
+
+
+def _blocky_ctx(tmp_path, base, other=None, amp=3, n=64):
+    """A flat material (optionally two, side by side) with 4x4 block noise."""
+    rng = np.random.default_rng(0)
+    noise = rng.integers(-amp, amp + 1, (n // 4, n // 4, 3))
+    noise = np.repeat(np.repeat(noise, 4, axis=0), 4, axis=1)
+    arr = np.zeros((n, n, 4), np.uint8)
+    arr[..., 3] = 255
+    arr[..., :3] = np.clip(np.asarray(base) + noise, 0, 255)
+    if other is not None:
+        arr[:, n // 2 :, :3] = np.clip(np.asarray(other) + noise[:, n // 2 :], 0, 255)
+    path = tmp_path / "blocky.png"
+    Image.fromarray(arr, "RGBA").save(path)
+    return load_context(path)
+
+
+def _raw_selection(ps):
+    """The same pixels with the selection denoise switched off."""
+    return type(ps)(idx=ps.idx, rgb=ps.rgb, lab=ps.lab, alpha=ps.alpha)
+
+
+def test_selection_is_steadier_than_the_block_noise(tmp_path):
+    """A material sitting partway up the tolerance ramp must not checkerboard.
+
+    The weight ramp is steep, so block noise of a few levels used to swing the
+    weight from block to block -- and the recolor with it.
+    """
+    yellow, blue = (235, 205, 110), (40, 70, 200)
+    ctx = _blocky_ctx(tmp_path, yellow, blue)
+    ps = ctx.full
+    source = rgb8_to_lab(yellow) + np.array([0.0, 9.0, -9.0], np.float32)
+    rule = RecolorRule(source_lab=source, target_lab=hex_to_lab("#1E50C8"))
+    left = (np.arange(len(ps)) % 64) < 32
+
+    steady = rule_weight(ps, rule, shape=ctx.shape_full)[left]
+    noisy = rule_weight(_raw_selection(ps), rule, shape=ctx.shape_full)[left]
+    assert 0.1 < steady.mean() < 0.9, "the fixture must sit on the ramp"
+    assert steady.std() < 0.75 * noisy.std()
+
+
+def test_selection_denoise_does_not_bleed_across_a_material_edge(tmp_path):
+    """Edge preserving: pixels beside the boundary keep their own color, so
+    the selection does not grow a halo into the neighbouring material."""
+    ctx = _blocky_ctx(tmp_path, (235, 205, 110), (40, 70, 200))
+    ps = ctx.full
+    drift = np.abs(ps.sel_lab - ps.lab).max()
+    assert drift < 4.0, f"selection colors moved {drift:.1f} LAB units"
+
+    rule = RecolorRule(
+        source_lab=rgb8_to_lab((235, 205, 110)), target_lab=hex_to_lab("#1E50C8")
+    )
+    w = rule_weight(ps, rule, shape=ctx.shape_full).reshape(64, 64)
+    assert w[:, :32].min() > 0.99 and w[:, 32:].max() == 0.0
+
+
+def test_gray_pixels_do_not_flicker_against_a_saturated_source(tmp_path):
+    """Grays half-claimed by a colored rule must be claimed evenly.
+
+    The polar chroma/hue split is singular at the neutral axis: a gray a unit
+    to either side of it read as the source's hue or as its opposite, so a
+    green rule punched 4x4 holes into the gray shoes it half-selected.
+    """
+    ctx = _blocky_ctx(tmp_path, (60, 60, 60))
+    ps = ctx.full
+    rule = RecolorRule(
+        source_lab=hex_to_lab("#364E16"),
+        target_lab=hex_to_lab("#141514"),
+        tolerance=12.7,
+    )
+    w = rule_weight(ps, rule, shape=ctx.shape_full)
+    assert w.mean() > 0.3, "the fixture must be partly selected"
+    assert w.min() > 0.0, "no holes"
+    assert w.std() < 0.15
+
+
+def test_boosting_chroma_does_not_amplify_hue_noise(tmp_path):
+    """A pale material sent to a saturated color must come back one hue.
+
+    Hue is an angle, so lifting a pixel from chroma 9 to chroma 70 magnifies
+    its hue noise eightfold in real color terms: a pale body told to go blue
+    arrived in purple and cyan blotches.
+    """
+    pale = (150, 160, 175)
+    ctx = _blocky_ctx(tmp_path, pale)
+    ps = ctx.full
+    rule = RecolorRule(
+        source_lab=rgb8_to_lab(pale), target_lab=hex_to_lab("#1E50C8"), tolerance=60
+    )
+    out = rule_transform(ps, rule)
+
+    def spread(hue):
+        resultant = np.abs(np.exp(1j * hue).mean())
+        return np.degrees(np.sqrt(max(-2.0 * np.log(max(resultant, 1e-9)), 0.0)))
+
+    before = spread(ps.h)
+    after = spread(np.arctan2(out[:, 2], out[:, 1]))
+    assert before > 5.0, "the fixture must carry hue noise"
+    assert after < 0.5 * before, f"hue spread {before:.1f} -> {after:.1f} deg"

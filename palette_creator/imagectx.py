@@ -8,14 +8,22 @@ for the settle pass and for export.
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
 from .colorspace import rgb_to_lab
-from .config import ALPHA_MIN_CLUSTER, ALPHA_MIN_RECOLOR, IMAGE_CACHE_SIZE, PROXY_SIZE
+from .config import (
+    ALPHA_MIN_CLUSTER,
+    ALPHA_MIN_RECOLOR,
+    IMAGE_CACHE_SIZE,
+    PROXY_SIZE,
+    SELECT_DENOISE_RADIUS,
+    SELECT_DENOISE_SIGMA_R,
+    SELECT_DENOISE_SIGMA_S,
+)
 
 
 @dataclass
@@ -30,6 +38,11 @@ class PixelSet:
     rgb: np.ndarray  # (N,3) float32, 0..1, original -- never mutated
     lab: np.ndarray  # (N,3) float32
     alpha: np.ndarray  # (N,) uint8
+    shape: tuple[int, int] | None = None
+    """``(H, W)`` of the frame ``idx`` points into. Needed only to build
+    :attr:`sel_lab`; without it selection falls back to the raw colors."""
+    _sel_lab: np.ndarray | None = field(default=None, repr=False, compare=False)
+    _sel_C: np.ndarray | None = field(default=None, repr=False, compare=False)
 
     @property
     def L(self) -> np.ndarray:
@@ -50,6 +63,36 @@ class PixelSet:
     def __len__(self) -> int:
         return int(self.idx.shape[0])
 
+    @property
+    def sel_lab(self) -> np.ndarray:
+        """Denoised LAB, for deciding *which* pixels a rule selects.
+
+        The renders come out of block-compressed textures and carry a few
+        levels of 4x4 block noise, invisible in the art. A selection weight is a
+        steep function of color, so measured on the raw pixels that noise flips
+        the weight from block to block and the recolor comes out splotched.
+
+        Only selection reads this. The transform always works from the real
+        pixels, so no detail is smoothed out of the result.
+
+        Built on first use (about 0.1 s for the proxy, under a second for a
+        1024px render) rather than at load, so flipping between renders that
+        have no rules yet stays instant.
+        """
+        if self._sel_lab is None:
+            if self.shape is None or len(self) == 0:
+                self._sel_lab = self.lab
+            else:
+                self._sel_lab = _denoise_for_selection(self.lab, self.idx, self.shape)
+        return self._sel_lab
+
+    @property
+    def sel_C(self) -> np.ndarray:
+        if self._sel_C is None:
+            sel = self.sel_lab
+            self._sel_C = np.hypot(sel[:, 1], sel[:, 2]).astype(np.float32)
+        return self._sel_C
+
     def opaque_mask(self, threshold: int = ALPHA_MIN_CLUSTER) -> np.ndarray:
         return self.alpha >= threshold
 
@@ -59,7 +102,63 @@ def _build_pixelset(rgba: np.ndarray) -> PixelSet:
     alpha = flat[:, 3]
     idx = np.flatnonzero(alpha >= ALPHA_MIN_RECOLOR).astype(np.int64)
     rgb = flat[idx, :3].astype(np.float32) / 255.0
-    return PixelSet(idx=idx, rgb=rgb, lab=rgb_to_lab(rgb), alpha=alpha[idx].copy())
+    return PixelSet(
+        idx=idx,
+        rgb=rgb,
+        lab=rgb_to_lab(rgb),
+        alpha=alpha[idx].copy(),
+        shape=(rgba.shape[0], rgba.shape[1]),
+    )
+
+
+def _denoise_for_selection(
+    lab: np.ndarray, idx: np.ndarray, shape: tuple[int, int]
+) -> np.ndarray:
+    """Bilateral-filter the recolorable pixels' LAB. Returns ``(N, 3)`` float32.
+
+    Edge preserving: a neighbour only contributes if its color is close
+    (``SELECT_DENOISE_SIGMA_R`` LAB units), so block noise of a few units is
+    averaged away while a real material boundary, tens of units across, stays
+    exactly where it is. The radius is 3 so the window spans a whole 4x4 block.
+    Transparent pixels never contribute.
+    """
+    radius = SELECT_DENOISE_RADIUS
+    h, w = shape
+    ys, xs = np.divmod(idx, w)
+    # Work inside the art's bounding box: the character rarely fills the frame.
+    y0, x0 = int(ys.min()), int(xs.min())
+    bh, bw = int(ys.max()) - y0 + 1, int(xs.max()) - x0 + 1
+    ys = ys - y0 + radius
+    xs = xs - x0 + radius
+
+    planes = np.zeros((3, bh + 2 * radius, bw + 2 * radius), dtype=np.float32)
+    valid = np.zeros((bh + 2 * radius, bw + 2 * radius), dtype=np.float32)
+    planes[:, ys, xs] = lab.T
+    valid[ys, xs] = 1.0
+
+    core = (slice(radius, radius + bh), slice(radius, radius + bw))
+    center = planes[(slice(None),) + core]
+    acc = np.zeros_like(center)
+    wsum = np.zeros((bh, bw), dtype=np.float32)
+    inv_s = 1.0 / (2.0 * SELECT_DENOISE_SIGMA_S**2)
+    inv_r = 1.0 / (2.0 * SELECT_DENOISE_SIGMA_R**2)
+
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            window = (
+                slice(radius + dy, radius + dy + bh),
+                slice(radius + dx, radius + dx + bw),
+            )
+            shifted = planes[(slice(None),) + window]
+            diff = shifted - center
+            d2 = np.einsum("chw,chw->hw", diff, diff)
+            k = np.exp(-(dx * dx + dy * dy) * inv_s - d2 * inv_r) * valid[window]
+            acc += k * shifted
+            wsum += k
+
+    # Every recolorable pixel counts itself at weight 1, so wsum >= 1 there.
+    out = acc / np.maximum(wsum, 1e-6)
+    return out[:, ys - radius, xs - radius].T.astype(np.float32)
 
 
 def _resize_rgba(rgba: np.ndarray, size: int) -> np.ndarray:
