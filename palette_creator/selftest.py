@@ -55,6 +55,12 @@ def _checks() -> list[str]:
 
     lines.append(f"project root {PROJECT_ROOT}")
 
+    from . import config
+    from .renders_location import resolve
+
+    found = resolve()  # never prompts; the startup prompt lives in ui.app.main
+    lines.append(f"renders {'found' if found else 'not found'} at {config.SOURCE_DIR}")
+
     app = App()  # needs customtkinter's bundled theme json and fonts
     app.update()
     app._on_close()

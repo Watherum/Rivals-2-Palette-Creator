@@ -33,8 +33,11 @@ def main() -> int:
             print(f"  {name:<16} MISSING - {exc}")
 
     print()
-    from palette_creator.config import SOURCE_DIR
+    from palette_creator import config
+    from palette_creator.renders_location import resolve
 
+    resolve()
+    SOURCE_DIR = config.SOURCE_DIR
     print(f"Renders    {SOURCE_DIR}")
     if SOURCE_DIR.is_dir():
         from palette_creator.library import Library

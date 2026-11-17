@@ -20,7 +20,8 @@ import customtkinter as ctk
 import numpy as np
 
 from ..colorspace import hex_to_rgb, rgb_to_hex
-from ..config import ALPHA_MIN_CLUSTER, KMEANS_DEFAULT_K, SOURCE_DIR
+from .. import config
+from ..config import ALPHA_MIN_CLUSTER, KMEANS_DEFAULT_K
 from ..imagectx import ContextCache
 from ..library import Library
 from ..palette_extract import Swatch, extract_palette, seed_for_path
@@ -356,7 +357,7 @@ class ReferenceTab(ctk.CTkFrame):
             self._load_render(render_file.path)
 
     def _open_file(self) -> None:
-        initial = SOURCE_DIR if SOURCE_DIR.is_dir() else Path.home()
+        initial = config.SOURCE_DIR if config.SOURCE_DIR.is_dir() else Path.home()
         path = filedialog.askopenfilename(
             title="Open a reference image",
             initialdir=str(initial),

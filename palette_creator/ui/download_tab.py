@@ -8,7 +8,8 @@ import tkinter as tk
 
 import customtkinter as ctk
 
-from ..config import DOWNLOAD_DELAY, SOURCE_DIR
+from .. import config
+from ..config import DOWNLOAD_DELAY
 from ..downloader import (
     DownloadOptions,
     ProgressEvent,
@@ -16,6 +17,7 @@ from ..downloader import (
     make_session,
     run_download,
 )
+from ..renders_location import choose_folder, remember, use
 from .widgets import FONT_MONO, FONT_SMALL, LabeledSlider, Tooltip, section_label
 
 MAX_LOG_LINES = 2000
@@ -118,15 +120,30 @@ class DownloadTab(ctk.CTkFrame):
         panel.grid_columnconfigure(0, weight=1)
         panel.grid_rowconfigure(5, weight=1)
 
-        ctk.CTkLabel(
-            panel,
-            text=f"Renders are saved to  {SOURCE_DIR}",
+        where = ctk.CTkFrame(panel, fg_color="transparent")
+        where.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
+        where.grid_columnconfigure(0, weight=1)
+        self._dest_label = ctk.CTkLabel(
+            where,
+            text="",
             font=FONT_SMALL,
             anchor="w",
             text_color="#999",
-            wraplength=760,
+            wraplength=640,
             justify="left",
-        ).grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
+        )
+        self._dest_label.grid(row=0, column=0, sticky="ew")
+        self._locate_btn = ctk.CTkButton(
+            where, text="Use existing renders...", width=150, height=26,
+            command=self._locate_existing,
+        )
+        self._locate_btn.grid(row=0, column=1, padx=(8, 0))
+        Tooltip(
+            self._locate_btn,
+            "Already have the renders (e.g. from the release zip)? Point the app "
+            "at them here instead of downloading them again.",
+        )
+        self._show_dest()
 
         buttons = ctk.CTkFrame(panel, fg_color="transparent")
         buttons.grid(row=1, column=0, sticky="ew", padx=12)
@@ -161,6 +178,27 @@ class DownloadTab(ctk.CTkFrame):
         self._log = ctk.CTkTextbox(panel, font=FONT_MONO, wrap="none")
         self._log.grid(row=5, column=0, sticky="nsew", padx=12, pady=(0, 12))
         self._log.configure(state="disabled")
+
+    # -- renders folder -----------------------------------------------------
+
+    def _show_dest(self) -> None:
+        self._dest_label.configure(text=f"Renders are read from and saved to  {config.SOURCE_DIR}")
+
+    def _locate_existing(self) -> None:
+        if self._running:
+            return
+        found = choose_folder(self, intro=False)
+        if found is None:
+            return
+        use(found)
+        remember(found)
+        self._show_dest()
+        self._append(f"Using renders in {found}")
+        for tab in (self.app.recolor_tab, self.app.reference_tab):
+            try:
+                tab.refresh_library()
+            except Exception:
+                pass
 
     # -- character list -----------------------------------------------------
 
@@ -208,6 +246,7 @@ class DownloadTab(ctk.CTkFrame):
         self._running = True
         self._cancel.clear()
         self._start.configure(state="disabled", text="Downloading...")
+        self._locate_btn.configure(state="disabled")
         self._cancel_btn.configure(state="normal")
         self._summary.configure(text="")
         self._overall.set(0)
@@ -296,6 +335,7 @@ class DownloadTab(ctk.CTkFrame):
         self._overall.set(1.0)
         self._current.set(1.0)
         self._start.configure(state="normal", text="Start download")
+        self._locate_btn.configure(state="normal")
         self._cancel_btn.configure(state="disabled", text="Cancel")
         self._summary.configure(text=message)
         self._append(f"\nDone: {message}")

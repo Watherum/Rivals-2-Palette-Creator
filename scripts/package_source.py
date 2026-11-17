@@ -1,12 +1,15 @@
-"""Zip the project into a release archive under dist/.
+"""Zip the Python source into a release archive under dist/.
 
-By default this packs source only (~300 KB). The Character_Renders_Source tree
-is 382 MB and the app can refetch it from the Downloads tab, so it ships only
-when you ask for it with --include-renders.
+For the standalone exe use BUILD_EXE.bat, or BUILD_RELEASE.bat for the exe
+plus renders.
 
-    python scripts/make_release.py                   source only
-    python scripts/make_release.py --include-renders source + 382 MB of renders
-    python scripts/make_release.py --force           overwrite an existing zip
+By default this packs source only. The Character_Renders_Source tree is large
+and the app can refetch it from the Downloads tab, so it ships only when you
+ask for it with --include-renders.
+
+    python scripts/package_source.py                   source only
+    python scripts/package_source.py --include-renders source + renders
+    python scripts/package_source.py --force           overwrite an existing zip
 """
 
 import argparse
@@ -30,7 +33,8 @@ ROOT = Path(__file__).resolve().parent.parent
 #                           cannot run them anyway
 #   scripts/bench_recolor.py     accuracy benchmark against official palettes
 #   scripts/validate_assets.py   bulk PNG corruption sweep
-#   scripts/make_release.py      this script
+#   scripts/package_source.py    this script
+#   scripts/build_exe.py         exe build, needs PyInstaller
 #   .gitignore              meaningless outside a checkout
 SOURCE_ITEMS = [
     "palette_creator",
@@ -123,7 +127,7 @@ def main() -> int:
     parser.add_argument(
         "--include-renders",
         action="store_true",
-        help=f"bundle {RENDERS.as_posix()} (382 MB) into the archive",
+        help=f"bundle {RENDERS.as_posix()} into the archive",
     )
     parser.add_argument(
         "--force",

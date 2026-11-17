@@ -14,7 +14,8 @@ import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import CHAR_CODES, NON_CHARACTER_FOLDERS, SOURCE_DIR
+from . import config
+from .config import CHAR_CODES, NON_CHARACTER_FOLDERS
 
 # Shown first in their dropdowns; everything else sorts alphabetically after.
 PINNED_SKINS = ("Default",)
@@ -70,7 +71,7 @@ class Library:
     """Scans SOURCE_DIR into a character -> skin -> palette -> RenderFile tree."""
 
     def __init__(self, source_dir: Path | None = None) -> None:
-        self.source_dir = Path(source_dir) if source_dir is not None else SOURCE_DIR
+        self.source_dir = Path(source_dir) if source_dir is not None else config.SOURCE_DIR
         self._tree: dict[str, dict[str, dict[str, RenderFile]]] = {}
         self._raw_stems: dict[tuple[str, str, str], str] = {}
         self.unparsed: list[Path] = []

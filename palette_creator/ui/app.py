@@ -123,5 +123,22 @@ def main() -> int:
         print("Re-run the Python installer and enable 'tcl/tk and IDLE'.", file=sys.stderr)
         return 1
 
+    _locate_renders()
     App().mainloop()
     return 0
+
+
+def _locate_renders() -> None:
+    """Find the renders before the window is built, asking if they are not
+    next to the app. Runs on a throwaway hidden root so the dialogs have an
+    owner; the smoke test builds App() directly and so never blocks here."""
+    from ..renders_location import locate_at_startup, resolve
+
+    if resolve():
+        return
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        locate_at_startup(root)
+    finally:
+        root.destroy()

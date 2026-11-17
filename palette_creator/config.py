@@ -17,7 +17,17 @@ def _project_root() -> Path:
 
 PROJECT_ROOT = _project_root()
 RESOURCES_DIR = PROJECT_ROOT / "Resources"
-SOURCE_DIR = RESOURCES_DIR / "Character_Renders_Source"
+DEFAULT_SOURCE_DIR = RESOURCES_DIR / "Character_Renders_Source"
+SOURCE_DIR = DEFAULT_SOURCE_DIR
+"""Where the renders are read from and downloaded to.
+
+Starts at DEFAULT_SOURCE_DIR and may be repointed at start-up by
+renders_location.py. Read it as ``config.SOURCE_DIR`` at call time, never with
+``from .config import SOURCE_DIR``, or the module keeps the stale default."""
+
+SETTINGS_FILE = RESOURCES_DIR / "settings.json"
+"""Per-install settings; currently just a remembered renders folder."""
+
 EXPORT_DIR = RESOURCES_DIR / "Character_Renders_Custom"
 PRESETS_DIR = RESOURCES_DIR / "Presets"
 

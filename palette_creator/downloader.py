@@ -25,12 +25,12 @@ from typing import Callable, Iterable, Literal
 
 import requests
 
+from . import config
 from .config import (
     API_TIMEOUT,
     CHAR_CODES,
     DOWNLOAD_DELAY,
     DOWNLOAD_TIMEOUT,
-    SOURCE_DIR,
     USER_AGENT,
     WIKI_API_URL,
     WIKI_PAGE_PREFIX,
@@ -56,7 +56,8 @@ class DownloadCancelled(Exception):
 
 @dataclass(frozen=True)
 class DownloadOptions:
-    dest_root: Path = SOURCE_DIR
+    # A factory, not a default value: SOURCE_DIR can be repointed at start-up.
+    dest_root: Path = field(default_factory=lambda: config.SOURCE_DIR)
     characters: tuple[str, ...] | None = None
     overwrite: bool = False
     delay: float = DOWNLOAD_DELAY
@@ -533,7 +534,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Only these characters (default: discover from the wiki).",
     )
     parser.add_argument(
-        "--dest", type=Path, default=SOURCE_DIR, help="Destination root folder."
+        "--dest", type=Path, default=None,
+        help="Destination root folder (default: the app's renders folder).",
     )
     parser.add_argument(
         "--overwrite", action="store_true", help="Re-download files already present."
@@ -550,6 +552,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Print the discovered character list and exit.",
     )
     args = parser.parse_args(argv)
+
+    if args.dest is None:
+        # Same lookup as the GUI (minus the prompt), so the CLI tops up the
+        # library the app actually reads rather than starting a second one.
+        from .renders_location import resolve
+
+        resolve()
+        args.dest = config.SOURCE_DIR
 
     if args.list_characters:
         for name in discover_characters(make_session(), _print_progress):

@@ -29,9 +29,10 @@ Zone.Identifier
 # --- app output (user-generated, not source) -------------------------------
 Resources/Character_Renders_Custom/
 Resources/Presets/
+Resources/settings.json
 
 # --- downloaded wiki assets ------------------------------------------------
-# Character_Renders_Source is deliberately tracked (~365 MB) so a fresh clone
+# Character_Renders_Source is deliberately tracked so a fresh clone
 # works without running Python_Scripts/download_rivals_renders.py first.
 # Uncomment to stop shipping them:
 # Resources/Character_Renders_Source/

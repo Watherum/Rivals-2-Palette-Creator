@@ -233,8 +233,9 @@ main.py                     entry point
 install_requirements.bat    one-time dependency install
 RUN_PALETTE_CREATOR.bat     launch
 run_debug.bat               launch with a console
-MAKE_RELEASE.bat            zip a release into dist/            (dev only)
+PACKAGE_SOURCE.bat          zip the Python source into dist/    (dev only)
 BUILD_EXE.bat               build the standalone exe into dist/ (dev only)
+BUILD_RELEASE.bat           exe + renders zip into dist/        (dev only)
 palette_creator.spec        PyInstaller recipe for the exe      (dev only)
 palette_creator/
   config.py                 paths and tunable constants
@@ -245,6 +246,7 @@ palette_creator/
   palette_extract.py        k-means -> swatches
   downloader.py             dragdown.wiki, GUI + CLI
   presets.py                rule sets as JSON
+  renders_location.py       finds the renders, asks if they are missing
   ui/                       CustomTkinter widgets
 Python_Scripts/
   download_rivals_renders.py   the downloader as a standalone CLI
@@ -252,13 +254,14 @@ scripts/
   check_env.py              interpreter and package versions
   validate_assets.py        open every PNG, report corruption    (dev only)
   bench_recolor.py          accuracy against official palettes   (dev only)
-  make_release.py           build the release zip                (dev only)
+  package_source.py         build the source zip                 (dev only)
   build_exe.py              build and smoke test the exe         (dev only)
 tests/                      pytest                               (dev only)
 Resources/
   Character_Renders_Source/ downloaded renders (never modified)
   Character_Renders_Custom/ your exports
   Presets/                  saved rule sets
+  settings.json             remembered renders folder, if not the default
 ```
 
 ## Tests
@@ -277,10 +280,16 @@ never reaches a transparent pixel.
 
 ## Releases
 
+There are two kinds of release. `BUILD_RELEASE.bat` makes the one most users
+want: the standalone exe zipped together with the renders (see
+[Standalone exe](#standalone-exe)), so nobody has to pull the whole render
+library from dragdown.wiki one file at a time. `PACKAGE_SOURCE.bat` makes a source zip for
+people who run the app with their own Python:
+
 ```
-MAKE_RELEASE.bat                                 source only, ~85 KB
-MAKE_RELEASE.bat --include-renders               adds the 382 MB render tree
-python scripts\make_release.py --force           overwrite an existing zip
+PACKAGE_SOURCE.bat                               source only
+PACKAGE_SOURCE.bat --include-renders             adds the render tree
+python scripts\package_source.py --force         overwrite an existing zip
 ```
 
 Writes `dist\Rivals-2-Palette-Creator-v<version>.zip`, versioned from
@@ -298,7 +307,7 @@ without it, a failed start is silent and leaves the user nothing to report.
 
 Renders are excluded by default, since the Downloads tab refetches them. When
 included they are **stored rather than deflated** — PNG data is already
-compressed, and deflating it *grew* the archive from 382 MB to 418 MB. No step
+compressed, and deflating it made the archive *larger*, not smaller. No step
 in the release path decodes or re-encodes an image; every archived file is
 byte-identical to its source, which the build verifies by CRC-32 against the
 original bytes before it reports success.
@@ -306,16 +315,33 @@ original bytes before it reports success.
 ## Standalone exe
 
 ```
-BUILD_EXE.bat                                    dist\Rivals-2-Palette-Creator-v<version>.exe
-BUILD_EXE.bat --include-renders                  also zips the exe with the render tree
+BUILD_RELEASE.bat                                exe + ...-with-renders.zip  (the release)
+BUILD_EXE.bat                                    dist\Rivals-2-Palette-Creator-v<version>.exe only
 BUILD_EXE.bat --clean                            rebuild the build venv and caches first
 ```
 
-One windowed exe, about 60 MB, that runs on a Windows machine with no Python
+`BUILD_RELEASE.bat` is `build_exe.py --include-renders --force`: it deletes any
+previous zip for this version, then builds a fresh one. The zip holds the exe
+with `Resources\Character_Renders_Source\` right beside it, stored rather than
+deflated, so extracting it is the whole install.
+
+One windowed exe that runs on a Windows machine with no Python
 installed. It keeps its data in a `Resources` folder **next to the exe**
 (created on first download, export or preset save), so put the exe in a folder
-of its own rather than somewhere read-only. Renders come from the Downloads tab
-or from the `--include-renders` zip.
+of its own rather than somewhere read-only.
+
+Finding the renders, at every launch:
+
+1. `Resources\Character_Renders_Source` next to the exe (where the release zip
+   puts them);
+2. otherwise the folder picked on an earlier launch, remembered in
+   `Resources\settings.json`;
+3. otherwise it asks. Picking the extracted release folder, its `Resources`
+   folder or the renders folder itself all work. Cancel to fetch them from the
+   Downloads tab instead, and **Use existing renders...** on that tab points
+   at a folder later.
+
+Running from source follows the same steps, starting from the repo root.
 
 `scripts\build_exe.py` does the work in three steps:
 

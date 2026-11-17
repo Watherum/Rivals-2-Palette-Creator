@@ -12,8 +12,10 @@ fail the build unless it comes up cleanly.
 The venv matters. PyInstaller bundles whatever the interpreter can import, so
 building from a global Python drags unrelated packages into the exe.
 
-The exe keeps its data in a Resources folder next to itself; renders come from
-the Downloads tab, or from the --include-renders zip.
+The exe keeps its data in a Resources folder next to itself. --include-renders
+(what BUILD_RELEASE.bat passes) zips the exe with Resources/Character_Renders_Source
+beside it, which the exe finds on its own once extracted; without it, the exe
+asks where the renders are, or the user fetches them from the Downloads tab.
 """
 
 import argparse
@@ -93,15 +95,39 @@ def smoke_test(exe: Path) -> None:
         print(f"  started and exited cleanly in {elapsed:.1f} s")
 
 
-def zip_with_renders(exe: Path, version: str, force: bool) -> Path:
-    source = ROOT / RENDERS
-    if not source.is_dir():
+def renders_zip_path(exe: Path) -> Path:
+    return exe.with_name(f"{exe.stem}-with-renders.zip")
+
+
+def check_renders_zip(exe: Path, force: bool) -> None:
+    """Fail before the multi-minute build, not after it. With --force, delete
+    the old zip up front so a build that fails part-way cannot leave a stale
+    one sitting in dist/ looking like the new release."""
+    if not (ROOT / RENDERS).is_dir():
         raise SystemExit(f"ERROR: --include-renders but {RENDERS.as_posix()} does not exist.")
-    out = exe.with_name(f"{exe.stem}-with-renders.zip")
-    if out.exists() and not force:
-        raise SystemExit(f"ERROR: {out.name} already exists. Re-run with --force.")
+    out = renders_zip_path(exe)
+    if not out.exists():
+        return
+    if not force:
+        raise SystemExit(
+            f"ERROR: {out.name} already exists. Re-run with --force, or bump __version__."
+        )
+    print(f"Removing the previous {out.name}...")
+    out.unlink()
+
+
+def zip_with_renders(exe: Path, version: str) -> Path:
+    """exe at the top of the folder, renders at Resources/Character_Renders_Source
+    beside it: exactly where the exe looks first, so extracting is all it takes."""
+    source = ROOT / RENDERS
+    out = renders_zip_path(exe)
     folder = f"Rivals-2-Palette-Creator-{version}"
-    files = sorted(p for p in source.rglob("*") if p.is_file() and p.name != "Thumbs.db")
+    files = sorted(
+        p for p in source.rglob("*")
+        if p.is_file()
+        and p.name not in ("Thumbs.db", "desktop.ini")
+        and not p.name.endswith(".part")  # an interrupted download
+    )
     print(f"Writing {out.name} (exe + {len(files):,} renders)...")
     # Stored, not deflated: the exe and the PNGs are already compressed.
     with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as zf:
@@ -140,6 +166,9 @@ def main() -> int:
     print(f"Rivals 2 Palette Creator - exe build {version}")
     print()
 
+    if args.include_renders:
+        check_renders_zip(exe, args.force)
+
     python = build_python(not args.no_venv, args.clean)
     if args.clean and WORK.exists():
         shutil.rmtree(WORK)
@@ -166,7 +195,7 @@ def main() -> int:
 
     outputs = [exe]
     if args.include_renders:
-        outputs.append(zip_with_renders(exe, version, args.force))
+        outputs.append(zip_with_renders(exe, version))
         print()
 
     print("=" * 60)
