@@ -379,13 +379,3 @@ exe attached to a GitHub release.
   folder was removed from this library.
 - Palette and skin lists are always derived from what is on disk, never
   hardcoded — new ones appear automatically after a download.
-
-## Possible next step
-
-The library already contains paired ground truth: the same skin in Neutral, Red,
-Blue and so on, differing only in color. Clustering each pixel's *signature
-across all of a skin's palettes* could recover the true material/UV regions and
-sidestep the limitation above entirely, giving exact selection. An initial probe
-was inconclusive — the obvious metric measures the wrong thing, since one
-material legitimately spans a wide color range — so this needs real research
-time rather than a quick patch.
